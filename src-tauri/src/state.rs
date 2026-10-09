@@ -45,6 +45,12 @@ pub struct AppState {
 
     /// TMDB session flags and the in-flight enrichment set.
     pub tmdb: Arc<crate::tmdb::session::TmdbSession>,
+
+    /// MPV inside the app window (Windows); see `playback::embedded`.
+    pub embedded: Arc<crate::playback::embedded::EmbeddedPlayer>,
+
+    /// Highlightly requests left today, from the last response.
+    pub sports_quota: Arc<crate::sports::Quota>,
 }
 
 impl AppState {
@@ -55,6 +61,8 @@ impl AppState {
             mpv_player: Arc::new(Mutex::new(crate::playback::mpv::MpvPlayer::new())),
             epg_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             tmdb: Arc::new(crate::tmdb::session::TmdbSession::default()),
+            embedded: Arc::default(),
+            sports_quota: Arc::new(crate::sports::Quota::new()),
         }
     }
 }

@@ -131,6 +131,8 @@ export function useEpgData(
                   currentEnd: raw.current_end ?? undefined,
                   next: raw.next ?? undefined,
                   nextStart: raw.next_start ?? undefined,
+                  currentAge: raw.current_age ?? undefined,
+                  currentCategory: raw.current_category ?? undefined,
                 }
               : null;
           // Nothing usable, or an entry that is already stale (storing it would

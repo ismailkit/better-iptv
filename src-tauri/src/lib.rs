@@ -10,6 +10,7 @@ mod playback;
 mod playlist;
 mod playlist_domain;
 mod series_domain;
+mod sports;
 mod state;
 mod tmdb;
 mod tmdb_domain;
@@ -122,6 +123,10 @@ pub fn run() {
                 // Run migration for active profile setting
                 ensure_active_profile(&conn).expect("Failed to ensure active profile setting");
 
+                if let Err(e) = sports::ensure_cache_table(&conn) {
+                    warn!("Failed to prepare the sports cache: {}", e);
+                }
+
                 // Update EPG IDs for existing channels (for migration)
                 match db::mutations::update_channel_epg_ids(&conn) {
                     Ok(count) => {
@@ -163,6 +168,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // MPV commands
             check_mpv_installed,
+            player_capabilities,
+            player_set_rect,
+            player_set_property,
+            player_seek,
+            player_frame_step,
+            sports_quota,
+            sports_set_key,
+            sports_find_match,
+            sports_match,
+            sports_highlights,
+            sports_lineups,
             play_channel,
             stop_playback,
             playback_status,
@@ -199,6 +215,7 @@ pub fn run() {
             get_channels_epg,
             get_guide,
             get_guide_epg_ids,
+            get_current_ages,
             get_epg_status,
             force_refresh_epg,
             // Parental controls commands
@@ -222,8 +239,15 @@ pub fn run() {
             get_home_rows,
             get_home_pick,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // The embedded MPV is a separate process: end it with the app.
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                tauri::async_runtime::block_on(state.embedded.shutdown());
+            }
+        });
 }
 
 #[cfg(test)]

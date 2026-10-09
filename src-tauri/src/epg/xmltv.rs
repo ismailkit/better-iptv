@@ -1,4 +1,4 @@
-use crate::epg_domain::normalize_epg_id;
+use crate::epg_domain::{age_from_rating, age_from_text, normalize_epg_id};
 use crate::http::{download_error, ensure_success, get_http_client};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -20,6 +20,9 @@ pub struct EpgProgram {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub category: Option<String>,
+    /// Minimum age from the programme's `<rating>` elements (highest wins).
+    #[serde(default)]
+    pub age_rating: Option<u8>,
 }
 
 /// Shown when a feed downloads fine but holds no programmes: an empty file
@@ -175,6 +178,9 @@ fn parse_xmltv<R: BufRead>(source: R) -> ParsedXmltv<R> {
     let mut in_title = false;
     let mut in_desc = false;
     let mut in_category = false;
+    // `<value>` inside `<rating>`; `<value>` also appears in other elements.
+    let mut in_rating = false;
+    let mut in_rating_value = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -207,12 +213,15 @@ fn parse_xmltv<R: BufRead>(source: R) -> ParsedXmltv<R> {
                             start_time: start,
                             end_time: end,
                             category: None,
+                            age_rating: None,
                         });
                     }
                 }
                 b"title" => in_title = true,
                 b"desc" => in_desc = true,
                 b"category" => in_category = true,
+                b"rating" => in_rating = true,
+                b"value" if in_rating => in_rating_value = true,
                 _ => {}
             },
             Ok(Event::Text(e)) => {
@@ -224,6 +233,11 @@ fn parse_xmltv<R: BufRead>(source: R) -> ParsedXmltv<R> {
                         prog.description = Some(text);
                     } else if in_category {
                         prog.category = Some(text);
+                    } else if in_rating_value {
+                        let age = age_from_rating(&text);
+                        if age > prog.age_rating {
+                            prog.age_rating = age;
+                        }
                     }
                 }
             }
@@ -238,6 +252,11 @@ fn parse_xmltv<R: BufRead>(source: R) -> ParsedXmltv<R> {
                 b"title" => in_title = false,
                 b"desc" => in_desc = false,
                 b"category" => in_category = false,
+                b"rating" => {
+                    in_rating = false;
+                    in_rating_value = false;
+                }
+                b"value" => in_rating_value = false,
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -337,13 +356,14 @@ fn store_programs(conn: &Connection, programs: &[EpgProgram]) -> Result<usize> {
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO epg_programs
-             (channel_epg_id, title, description, start_time, end_time, category)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             (channel_epg_id, title, description, start_time, end_time, category, age_rating)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(channel_epg_id, start_time) DO UPDATE SET
                  title = excluded.title,
                  description = excluded.description,
                  end_time = excluded.end_time,
-                 category = excluded.category",
+                 category = excluded.category,
+                 age_rating = excluded.age_rating",
         )?;
 
         for program in programs {
@@ -354,6 +374,7 @@ fn store_programs(conn: &Connection, programs: &[EpgProgram]) -> Result<usize> {
                 program.start_time.to_rfc3339(),
                 program.end_time.to_rfc3339(),
                 program.category,
+                program.age_rating,
             ])?;
             count += 1;
         }
@@ -411,6 +432,20 @@ pub struct ChannelEpg {
     pub current_end: Option<String>,
     pub next: Option<String>,
     pub next_start: Option<String>,
+    /// Minimum age for the current programme: its `<rating>`, else an age
+    /// written into its title or synopsis ("(18+)", "PEGI 16").
+    pub current_age: Option<u8>,
+    /// The current programme's genre ("Football", "Sports"), for spotting a match.
+    pub current_category: Option<String>,
+}
+
+/// The current programme as read for `ChannelEpg`.
+struct CurrentRow {
+    title: String,
+    start: String,
+    end: String,
+    age: Option<u8>,
+    category: Option<String>,
 }
 
 /// Look up current and next programme for many channels in one go.
@@ -426,7 +461,7 @@ pub fn get_programs_for_channels(
     let now = Utc::now().to_rfc3339();
 
     let mut current_stmt = conn.prepare_cached(
-        "SELECT title, start_time, end_time FROM epg_programs
+        "SELECT title, start_time, end_time, age_rating, description, category FROM epg_programs
          WHERE channel_epg_id = ?1 AND start_time <= ?2 AND end_time > ?2
          ORDER BY start_time DESC
          LIMIT 1",
@@ -445,9 +480,18 @@ pub fn get_programs_for_channels(
         }
         // Stored ids are normalised; the result stays keyed by the id asked for.
         let key = normalize_epg_id(id);
-        let current: Option<(String, String, String)> = current_stmt
+        let current: Option<CurrentRow> = current_stmt
             .query_row(rusqlite::params![key, now], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                let title: String = row.get(0)?;
+                let description: Option<String> = row.get(4)?;
+                let age = programme_age(row.get(3)?, &title, description.as_deref());
+                Ok(CurrentRow {
+                    title,
+                    start: row.get(1)?,
+                    end: row.get(2)?,
+                    age,
+                    category: row.get(5)?,
+                })
             })
             .optional()?;
         let next: Option<(String, String)> = next_stmt
@@ -456,9 +500,10 @@ pub fn get_programs_for_channels(
             })
             .optional()?;
         if current.is_some() || next.is_some() {
-            let (current, current_start, current_end) = match current {
-                Some((t, s, e)) => (Some(t), Some(s), Some(e)),
-                None => (None, None, None),
+            let (current, current_start, current_end, current_age, current_category) = match current
+            {
+                Some(c) => (Some(c.title), Some(c.start), Some(c.end), c.age, c.category),
+                None => (None, None, None, None, None),
             };
             let (next, next_start) = match next {
                 Some((t, s)) => (Some(t), Some(s)),
@@ -472,6 +517,8 @@ pub fn get_programs_for_channels(
                     current_end,
                     next,
                     next_start,
+                    current_age,
+                    current_category,
                 },
             );
         }
@@ -487,6 +534,18 @@ pub struct GuideProgram {
     pub description: Option<String>,
     pub start_time: String,
     pub end_time: String,
+    /// Minimum age: the `<rating>`, else one written into the title or
+    /// synopsis. The guide's age filter reads it.
+    pub age: Option<u8>,
+}
+
+/// A programme's minimum age from its stored rating, else from an explicit
+/// age in its title or synopsis ("(18+)", "PEGI 16"). Text is checked at
+/// read time, so rows stored before ratings were parsed still get an age.
+fn programme_age(rated: Option<u8>, title: &str, description: Option<&str>) -> Option<u8> {
+    rated
+        .or_else(|| age_from_text(title))
+        .or_else(|| description.and_then(age_from_text))
 }
 
 /// Programmes for many channels within a time window.
@@ -506,7 +565,7 @@ pub fn get_guide(
     to: &str,
 ) -> Result<HashMap<String, Vec<GuideProgram>>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT title, description, start_time, end_time FROM epg_programs
+        "SELECT title, description, start_time, end_time, age_rating FROM epg_programs
          WHERE channel_epg_id = ?1 AND end_time > ?2 AND start_time < ?3
          ORDER BY start_time",
     )?;
@@ -520,11 +579,15 @@ pub fn get_guide(
         let key = normalize_epg_id(id);
         let programmes = stmt
             .query_map(rusqlite::params![key, from, to], |row| {
+                let title: String = row.get(0)?;
+                let description: Option<String> = row.get(1)?;
+                let age = programme_age(row.get(4)?, &title, description.as_deref());
                 Ok(GuideProgram {
-                    title: row.get(0)?,
-                    description: row.get(1)?,
+                    title,
+                    description,
                     start_time: row.get(2)?,
                     end_time: row.get(3)?,
+                    age,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -532,6 +595,34 @@ pub fn get_guide(
     }
 
     Ok(result)
+}
+
+/// The minimum age of what is on now, per (normalized) EPG id, for every
+/// channel whose current programme has one. The channel list's age filter
+/// needs every channel, not only the cards in view, so this is one scan of
+/// the programmes airing now rather than a lookup per id.
+pub fn get_current_ages(conn: &Connection) -> Result<HashMap<String, u8>> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare_cached(
+        "SELECT channel_epg_id, title, description, age_rating FROM epg_programs
+         WHERE start_time <= ?1 AND end_time > ?1",
+    )?;
+    let mut ages = HashMap::new();
+    let rows = stmt.query_map(rusqlite::params![now], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let description: Option<String> = row.get(2)?;
+        Ok((
+            id,
+            programme_age(row.get(3)?, &title, description.as_deref()),
+        ))
+    })?;
+    for row in rows {
+        if let (id, Some(age)) = row? {
+            ages.insert(id, age);
+        }
+    }
+    Ok(ages)
 }
 
 /// The EPG ids with at least one programme overlapping `from`-`to`, each once.
@@ -556,6 +647,7 @@ struct EpgProgramBuilder {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     category: Option<String>,
+    age_rating: Option<u8>,
 }
 
 impl EpgProgramBuilder {
@@ -567,6 +659,7 @@ impl EpgProgramBuilder {
             start_time: self.start_time,
             end_time: self.end_time,
             category: self.category,
+            age_rating: self.age_rating,
         }
     }
 }
@@ -585,7 +678,54 @@ mod tests {
             start_time: start,
             end_time: start + Duration::minutes(minutes),
             category: None,
+            age_rating: None,
         }
+    }
+
+    #[test]
+    fn ratings_are_parsed_stored_and_served_as_the_current_age() {
+        let now = Utc::now();
+        let fmt = |t: DateTime<Utc>| t.format("%Y%m%d%H%M%S +0000").to_string();
+        let xml = format!(
+            r#"<tv>
+              <programme channel="a.se" start="{s}" stop="{e}">
+                <title>Late film</title>
+                <rating system="FSK"><value>16</value></rating>
+                <rating system="PEGI"><value>18</value><icon src="x.png"/></rating>
+              </programme>
+              <programme channel="b.se" start="{s}" stop="{e}">
+                <title>Thriller (16+)</title>
+              </programme>
+              <programme channel="c.se" start="{s}" stop="{e}">
+                <title>Episode 12</title>
+              </programme>
+            </tv>"#,
+            s = fmt(now - Duration::minutes(5)),
+            e = fmt(now + Duration::minutes(30)),
+        );
+        let programs = parse_epg_bytes(xml.as_bytes()).unwrap();
+        assert_eq!(programs[0].age_rating, Some(18));
+        assert_eq!(programs[1].age_rating, None);
+
+        let conn = setup_test_db();
+        store_epg_programs(&conn, &programs).unwrap();
+        let ids = ["a.se", "b.se", "c.se"].map(String::from);
+        let epg = get_programs_for_channels(&conn, &ids).unwrap();
+        assert_eq!(epg["a.se"].current_age, Some(18));
+        // No <rating>: read from the title.
+        assert_eq!(epg["b.se"].current_age, Some(16));
+        assert_eq!(epg["c.se"].current_age, None);
+
+        // The age filter's reads: every channel on now, and guide blocks.
+        let ages = get_current_ages(&conn).unwrap();
+        assert_eq!(ages.get("a.se"), Some(&18));
+        assert_eq!(ages.get("b.se"), Some(&16));
+        assert!(!ages.contains_key("c.se"));
+        let from = (now - Duration::hours(1)).to_rfc3339();
+        let to = (now + Duration::hours(1)).to_rfc3339();
+        let guide = get_guide(&conn, &ids, &from, &to).unwrap();
+        assert_eq!(guide["b.se"][0].age, Some(16));
+        assert_eq!(guide["c.se"][0].age, None);
     }
 
     #[test]

@@ -58,7 +58,7 @@ fn validate_stream_url(url: &str) -> Result<()> {
 ///
 /// On Windows, checks for bundled MPV first, then falls back to system PATH.
 /// On macOS/Linux, uses system MPV only.
-fn get_mpv_path() -> PathBuf {
+pub(crate) fn get_mpv_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         // Try bundled MPV first (Windows only)
@@ -127,7 +127,7 @@ impl MpvPlayer {
     }
 
     /// Apply MPV arguments from playback options
-    fn apply_args(cmd: &mut Command, options: &MpvPlaybackOptions) {
+    pub(crate) fn apply_args(cmd: &mut Command, options: &MpvPlaybackOptions) {
         // Hardware acceleration
         if options.hwdec {
             cmd.arg("--hwdec=auto");

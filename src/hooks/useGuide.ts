@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getGuide, getGuideEpgIds, type GuideProgram } from '../lib/tauri';
-import { guideChannels, guideDataRange, guideWindow, normalizeEpgId } from '../lib/guideLayout';
+import {
+  GUIDE_DEFAULT_HOURS,
+  guideChannels,
+  guideDataRange,
+  guideWindow,
+  normalizeEpgId,
+} from '../lib/guideLayout';
 import { logger } from '../lib/logger';
 import type { Channel } from '../types';
 
@@ -40,7 +46,14 @@ function dayStart(now: number): number {
  * lookup falls back to every channel with an id; a failed programme request
  * leaves rows without programmes. Both are logged, not shown.
  */
-export function useGuide(channels: Channel[], dayOffset: number): GuideState {
+export function useGuide(
+  channels: Channel[],
+  dayOffset: number,
+  /** The window's zoom (hours across) and how far it was moved (half-windows). */
+  view: { hours?: number; shift?: number } = {}
+): GuideState {
+  const hours = view.hours ?? GUIDE_DEFAULT_HOURS;
+  const shift = view.shift ?? 0;
   const [tick, setTick] = useState(0);
   const [today, setToday] = useState(() => dayStart(Date.now()));
   // A new calendar day goes through step 1, whose answer reads the
@@ -108,18 +121,18 @@ export function useGuide(channels: Channel[], dayOffset: number): GuideState {
   // it matches the current one they are not this request's, and the guide
   // still counts as loading, so rows never flash "No guide data" between a
   // new set of ids and the request that fetches them.
-  const requestKey = `${idsKey}\u0001${dayOffset}`;
+  const requestKey = `${idsKey}\u0001${dayOffset}\u0001${hours}\u0001${shift}`;
   const [state, setState] = useState<
     Omit<GuideState, 'rows' | 'rowsLoading'> & { forKey: string | null }
   >(() => ({
     programs: {},
-    window: guideWindow(Date.now(), dayOffset),
+    window: guideWindow(Date.now(), dayOffset, hours, shift),
     loading: true,
     forKey: null,
   }));
   useEffect(() => {
-    const forKey = `${idsKey}\u0001${dayOffset}`;
-    const win = guideWindow(Date.now(), dayOffset);
+    const forKey = `${idsKey}\u0001${dayOffset}\u0001${hours}\u0001${shift}`;
+    const win = guideWindow(Date.now(), dayOffset, hours, shift);
     const ids = idsKey === '' ? [] : idsKey.split(SEP);
     if (ids.length === 0) {
       setState({ programs: {}, window: win, loading: false, forKey });
@@ -149,7 +162,7 @@ export function useGuide(channels: Channel[], dayOffset: number): GuideState {
     };
     // answers: a new lookup answer (refresh, new day) reads the programmes
     // again once, with the ids it brought.
-  }, [idsKey, dayOffset, tick, answers]);
+  }, [idsKey, dayOffset, hours, shift, tick, answers]);
 
   return {
     programs: state.programs,

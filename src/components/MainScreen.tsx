@@ -1,4 +1,13 @@
-import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useState,
+  useRef,
+  useCallback,
+  useMemo,
+} from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { usePlayerStore, type Section } from '../stores/player-store';
 import {
@@ -13,6 +22,24 @@ import {
   type TmdbStatus,
 } from '../lib/tauri';
 import { CategoryBar } from './CategoryBar';
+import { ALL_KEY, CategoryGrid, FAVORITES_KEY } from './CategoryGrid';
+import { DisplayPanel } from './DisplayPanel';
+import { createPortal } from 'react-dom';
+// Loaded on first use: most sessions browse before playing, and the match
+// centre only opens on demand, so neither belongs in the startup bundle.
+const PlayerLayer = lazy(() =>
+  import('./player/PlayerLayer').then((m) => ({ default: m.PlayerLayer }))
+);
+const MatchModal = lazy(() =>
+  import('./sports/MatchModal').then((m) => ({ default: m.MatchModal }))
+);
+import { usePlayerBridge } from '../hooks/usePlayerBridge';
+import { usePlayerUi } from '../stores/player-ui-store';
+import { detectChannelMatch } from '../hooks/useMatchData';
+import type { DetectedMatch } from '../lib/matchDetect';
+import type { ChannelCardLayout } from './ChannelCard';
+import { CHANNEL_CARD_SIZES, useDisplayStore, type CardSize } from '../stores/display-store';
+import { useSpatialNavigation } from '../hooks/useSpatialNavigation';
 import { GuideView } from './GuideView';
 import { HomeView } from './HomeView';
 import { ChannelCard } from './ChannelCard';
@@ -22,7 +49,7 @@ import { NowPlayingBar } from './NowPlayingBar';
 import { Toast } from './Toast';
 import { Rail } from './Rail';
 import { TopBar } from './TopBar';
-import { Search } from 'lucide-react';
+import { ArrowLeft, Search, SlidersHorizontal, Star } from 'lucide-react';
 import DetailView from './DetailView';
 import Settings, { type SettingsHandle } from './Settings';
 import PinEntryModal from './modals/PinEntryModal';
@@ -70,6 +97,23 @@ const SECTION_COUNT_NOUNS: Record<Exclude<Section, 'guide' | 'home'>, [string, s
 };
 const RESULT_NOUNS: [string, string] = ['result', 'results'];
 
+/** Channel-card text size per card size. */
+const CARD_TEXT_SCALE: Record<CardSize, number> = { sm: 0.9, md: 1, lg: 1.25, xl: 1.5 };
+/** Height of a live card's info block at text scale 1 (name, now, next, padding). */
+const CARD_INFO_HEIGHT = 84;
+const GRID_GAP = 16;
+
+/** Counts a play towards "Most visited" once it really started (not a stop toggle or a failure). */
+function recordVisitIfPlaying(channel: Channel) {
+  const { isPlaying, currentChannel } = usePlayerStore.getState();
+  if (isPlaying && currentChannel?.id === channel.id) {
+    useDisplayStore.getState().recordChannelVisit(channel.id, channel.group_name);
+  }
+}
+
+/** Which channels Live TV lists while the category cards are on and none is picked. */
+type LiveScope = 'categories' | 'all' | 'favorites';
+
 function countLabel(n: number, [one, many]: [string, string]): string {
   return `${n.toLocaleString()} ${n === 1 ? one : many}`;
 }
@@ -98,11 +142,53 @@ export default function MainScreen() {
   const setSearchQuery = usePlayerStore((s) => s.setSearchQuery);
   const setContentTypeFilter = usePlayerStore((s) => s.setContentTypeFilter);
   const setCategories = usePlayerStore((s) => s.setCategories);
+  const categories = usePlayerStore((s) => s.categories);
   const debouncedSearchQuery = useDebouncedValue(searchQuery, 300);
   const trimmedQuery = debouncedSearchQuery.trim();
 
   // Consolidated channel filtering (content type, category, parental, search)
-  const filteredChannels = useChannelFilter(debouncedSearchQuery);
+  const allFilteredChannels = useChannelFilter(debouncedSearchQuery);
+
+  // Live TV display settings: the category screen, card sizes, columns.
+  const categoryView = useDisplayStore((s) => s.categoryView);
+  const channelCardSize = useDisplayStore((s) => s.channelCardSize);
+  const channelColumns = useDisplayStore((s) => s.channelColumns);
+  const channelShowLogo = useDisplayStore((s) => s.channelShowLogo);
+  const channelShowEpg = useDisplayStore((s) => s.channelShowEpg);
+  const channelShowGroup = useDisplayStore((s) => s.channelShowGroup);
+  const ageTags = useDisplayStore((s) => s.ageTags);
+  const ageTagMin = useDisplayStore((s) => s.ageTagMin);
+  const categoryFavoritesOnly = useDisplayStore((s) => s.categoryFavoritesOnly);
+  const setDisplay = useDisplayStore((s) => s.set);
+  // Narrows the category cards by name; cleared on leaving Live TV.
+  const [categoryQuery, setCategoryQuery] = useState('');
+  const hiddenCategories = useDisplayStore((s) => s.hiddenCategories);
+  const [displayOpen, setDisplayOpen] = useState(false);
+  // The in-app player: whether playback happens inside the window, re-read
+  // when the Display panel changes the player mode.
+  const [playerConfigKey, setPlayerConfigKey] = useState(0);
+  usePlayerBridge(playerConfigKey);
+  const embedded = usePlayerUi((s) => s.embedded) === true;
+  const matchButtons = useDisplayStore((s) => s.matchButtons);
+  // The match centre opened from a channel card.
+  const [sportsTarget, setSportsTarget] = useState<{
+    channel: Channel;
+    detected: DetectedMatch;
+    startMs?: number;
+  } | null>(null);
+  const [liveScope, setLiveScope] = useState<LiveScope>('categories');
+  // The card last opened from the category screen, focused again on the way back.
+  const [lastCategory, setLastCategory] = useState<string | null>(null);
+  const liveCards = contentTypeFilter === 'live' && categoryView === 'cards';
+  const showCategoryCards =
+    liveCards && categoryFilter === null && liveScope === 'categories' && trimmedQuery === '';
+  const filteredChannels = useMemo(
+    () =>
+      liveCards && liveScope === 'favorites' && categoryFilter === null && trimmedQuery === ''
+        ? allFilteredChannels.filter((c) => c.is_favorite)
+        : allFilteredChannels,
+    [allFilteredChannels, liveCards, liveScope, categoryFilter, trimmedQuery]
+  );
 
   // Playback (hook handles polling + EPG updates)
   const {
@@ -196,7 +282,58 @@ export default function MainScreen() {
     debouncedSearchQuery.trim() === ''
       ? 'poster'
       : 'live';
-  const { columns, estimatedRowHeight } = useResponsiveGrid(kind);
+  const grid = useResponsiveGrid(kind);
+
+  // Live-shaped cards size from the display settings: the column count comes
+  // from the list's real width (it shrinks with the interface scale) unless a
+  // fixed count is set.
+  const [listWidth, setListWidth] = useState(0);
+  const listObserver = useRef<globalThis.ResizeObserver | null>(null);
+  const listRef = useCallback((node: HTMLDivElement | null) => {
+    parentRef.current = node;
+    listObserver.current?.disconnect();
+    listObserver.current = null;
+    if (!node || typeof globalThis.ResizeObserver === 'undefined') return;
+    const observer = new globalThis.ResizeObserver(([entry]) =>
+      setListWidth(Math.round(entry.contentRect.width))
+    );
+    observer.observe(node);
+    listObserver.current = observer;
+  }, []);
+  const cardSize = CHANNEL_CARD_SIZES[channelCardSize];
+  const cardLayout = useMemo<ChannelCardLayout>(
+    () => ({
+      art: cardSize.art,
+      textScale: CARD_TEXT_SCALE[channelCardSize],
+      showLogo: channelShowLogo,
+      showEpg: channelShowEpg,
+      showGroup: channelShowGroup,
+      ageTagMin: ageTags ? ageTagMin : undefined,
+    }),
+    [
+      cardSize,
+      channelCardSize,
+      channelShowLogo,
+      channelShowEpg,
+      channelShowGroup,
+      ageTags,
+      ageTagMin,
+    ]
+  );
+  const columns =
+    kind === 'poster'
+      ? grid.columns
+      : channelColumns > 0
+        ? channelColumns
+        : listWidth > 0
+          ? Math.max(1, Math.floor((listWidth + GRID_GAP) / (cardSize.minWidth + GRID_GAP)))
+          : grid.columns;
+  const estimatedRowHeight =
+    kind === 'poster'
+      ? grid.estimatedRowHeight
+      : cardLayout.art +
+        Math.round(CARD_INFO_HEIGHT * cardLayout.textScale * (channelShowEpg ? 1 : 0.6)) +
+        GRID_GAP;
 
   // Load parental settings on mount
   useEffect(() => {
@@ -388,7 +525,7 @@ export default function MainScreen() {
   // `filteredChannels`. Its `272 + 20` estimate is only the initial guess -
   // like every other row, it measures its own real height via
   // `measureElement`.
-  const gridRowCount = Math.ceil(filteredChannels.length / columns);
+  const gridRowCount = showCategoryCards ? 0 : Math.ceil(filteredChannels.length / columns);
   const rowCount = gridRowCount + (showHero ? 1 : 0);
 
   const rowVirtualizer = useVirtualizer({
@@ -406,7 +543,7 @@ export default function MainScreen() {
   // every card row's index by one, which needs the same remeasure.
   useEffect(() => {
     rowVirtualizer.measure();
-  }, [kind, columns, showHero, rowVirtualizer]);
+  }, [kind, columns, showHero, estimatedRowHeight, rowVirtualizer]);
 
   // A new list starts at the top: switching section, picking a category
   // chip, or starting/clearing a search all replace `filteredChannels`, and
@@ -417,7 +554,7 @@ export default function MainScreen() {
   // rows below, so the first render of the new list already starts at the
   // top instead of mounting rows at the old list's depth. The DOM follows
   // before paint.
-  const listKey = `${contentTypeFilter}\u0000${categoryFilter ?? ''}\u0000${trimmedQuery}`;
+  const listKey = `${contentTypeFilter}\u0000${categoryFilter ?? ''}\u0000${trimmedQuery}\u0000${liveScope}`;
   const [renderedListKey, setRenderedListKey] = useState(listKey);
   if (renderedListKey !== listKey) {
     setRenderedListKey(listKey);
@@ -445,6 +582,32 @@ export default function MainScreen() {
   // EPG for the live cards in view. The playing channel always rides along so
   // the dock stays fresh, also in sections without a grid.
   const { channelEpgData } = useEpgData(visibleChannels, currentChannel);
+  const epgRef = useRef(channelEpgData);
+  epgRef.current = channelEpgData;
+
+  // Stable across EPG updates, so the memoised cards do not re-render.
+  const openMatch = useCallback((channel: Channel) => {
+    const epg = epgRef.current.get(channel.id);
+    const detected = detectChannelMatch(channel, epg);
+    if (!detected) return;
+    setSportsTarget({
+      channel,
+      detected,
+      startMs: epg?.currentStart ? Date.parse(epg.currentStart) : undefined,
+    });
+  }, []);
+
+  // A new playback (from stopped) starts in the mini player, so browsing
+  // carries on; zapping inside the full player keeps it full.
+  const playingId = currentChannel?.id ?? null;
+  const prevPlayingId = useRef<number | null>(null);
+  useEffect(() => {
+    if (prevPlayingId.current === null && playingId !== null) {
+      usePlayerUi.getState().setMode('mini');
+    }
+    if (playingId === null) usePlayerUi.getState().resetMpv();
+    prevPlayingId.current = playingId;
+  }, [playingId]);
 
   // Visible poster rows feed the TMDB lookup, after the hero candidates of
   // both sections so the banner is warm before its section opens. Live rows
@@ -524,6 +687,7 @@ export default function MainScreen() {
 
       const result = await playChannelAction(channel);
       if (result?.type === 'series') openDetail(result.channel);
+      else recordVisitIfPlaying(channel);
     },
     [playChannelAction, openDetail]
   );
@@ -593,6 +757,7 @@ export default function MainScreen() {
       }
       playChannelAction(pendingChannel)
         .then(() => {
+          recordVisitIfPlaying(pendingChannel);
           setPendingChannel(null);
         })
         .catch((err) => {
@@ -604,6 +769,26 @@ export default function MainScreen() {
   const handleStop = useCallback(async () => {
     await stopPlaybackAction();
   }, [stopPlaybackAction]);
+
+  // Channel up/down from the full player: the list being browsed when it
+  // holds the playing channel, else all live channels.
+  const filteredRef = useRef<Channel[]>([]);
+  filteredRef.current = filteredChannels;
+  const zap = useCallback(
+    (delta: -1 | 1) => {
+      const playing = usePlayerStore.getState().currentChannel;
+      if (!playing) return;
+      const browsed = filteredRef.current;
+      const list = browsed.some((c) => c.id === playing.id)
+        ? browsed
+        : usePlayerStore.getState().liveChannels;
+      const i = list.findIndex((c) => c.id === playing.id);
+      if (i < 0 || list.length < 2) return;
+      const next = list[(i + delta + list.length) % list.length];
+      void handlePlayChannel(next);
+    },
+    [handlePlayChannel]
+  );
 
   const closeDetail = useCallback(() => {
     setDetailChannel(null);
@@ -644,6 +829,9 @@ export default function MainScreen() {
       const from = usePlayerStore.getState().contentTypeFilter;
       if (section === 'guide' && from !== 'guide') guideReturnRef.current = from;
       setContentTypeFilter(section);
+      setLiveScope('categories');
+      setLastCategory(null);
+      setCategoryQuery('');
       closeDetail();
     },
     [setContentTypeFilter, closeDetail]
@@ -720,6 +908,42 @@ export default function MainScreen() {
     }
   }, [view, contentTypeFilter, handleSection, setSearchQuery]);
 
+  // Live TV category cards: open a category (or All / Favorites), and back.
+  const setCategoryFilter = usePlayerStore((s) => s.setCategoryFilter);
+  const openCategory = useCallback(
+    (category: string) => {
+      setLastCategory(category);
+      useDisplayStore.getState().recordCategoryVisit(category);
+      setLiveScope('categories');
+      setCategoryFilter(category);
+    },
+    [setCategoryFilter]
+  );
+  const openLiveScope = useCallback(
+    (scope: Exclude<LiveScope, 'categories'>) => {
+      setLastCategory(scope === 'all' ? ALL_KEY : FAVORITES_KEY);
+      setCategoryFilter(null);
+      setLiveScope(scope);
+    },
+    [setCategoryFilter]
+  );
+  const backToCategories = useCallback(() => {
+    setCategoryFilter(null);
+    setLiveScope('categories');
+  }, [setCategoryFilter]);
+
+  // Opening a category from the cards moves focus to its first channel, so a
+  // remote keeps working: the card that had focus is gone.
+  useEffect(() => {
+    if (!liveCards || showCategoryCards) return;
+    const id = globalThis.requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
+      parentRef.current?.querySelector<globalThis.HTMLElement>('[data-nav]')?.focus();
+    });
+    return () => globalThis.cancelAnimationFrame(id);
+  }, [liveCards, showCategoryCards, categoryFilter, liveScope]);
+
   // Escape, after Settings / the profile menu / the guide's detail panel had
   // their chance (they preventDefault). True means "handled, keep playing".
   // Settings closes itself (respecting its inner dialogs), so a 'settings'
@@ -734,8 +958,45 @@ export default function MainScreen() {
       handleSection(guideReturnRef.current);
       return true;
     }
+    if (liveCards && !showCategoryCards && trimmedQuery === '') {
+      backToCategories();
+      return true;
+    }
     return false;
-  }, [view, detailOpen, closeDetail, contentTypeFilter, handleSection]);
+  }, [
+    view,
+    detailOpen,
+    closeDetail,
+    contentTypeFilter,
+    handleSection,
+    liveCards,
+    showCategoryCards,
+    trimmedQuery,
+    backToCategories,
+  ]);
+
+  // Backspace is "Back" on most TV remotes and on a keyboard used as one: it
+  // closes a view like Escape does, but never stops playback.
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Backspace' || e.defaultPrevented) return;
+      const t = e.target as globalThis.HTMLElement;
+      if (
+        t instanceof globalThis.HTMLInputElement ||
+        t instanceof globalThis.HTMLTextAreaElement ||
+        t.isContentEditable ||
+        document.querySelector('[aria-modal="true"]')
+      ) {
+        return;
+      }
+      if (handleEscapeView()) e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [handleEscapeView]);
+
+  // Arrow keys / a remote's D-pad move focus between cards, rail and top bar.
+  useSpatialNavigation(view !== 'settings');
 
   // Global keyboard shortcuts (Space=play/stop, /=focus search, G=guide,
   // Escape=close view, else stop)
@@ -750,6 +1011,22 @@ export default function MainScreen() {
     openUrl(update.url).catch((err) => logger.warn('Failed to open the release page:', err));
   }, [update]);
 
+  // Channels per category of the current section, for the Display panel.
+  const liveChannels = usePlayerStore((s) => s.liveChannels);
+  const sectionChannels =
+    contentTypeFilter === 'vod'
+      ? vodChannels
+      : contentTypeFilter === 'series'
+        ? seriesChannels
+        : liveChannels;
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of sectionChannels) {
+      if (c.group_name) counts.set(c.group_name, (counts.get(c.group_name) ?? 0) + 1);
+    }
+    return counts;
+  }, [sectionChannels]);
+
   const activeProfile = playlists.find((p) => p.id === activeProfileId);
   const profileInitial = activeProfile?.name.trim().charAt(0).toUpperCase() || '?';
 
@@ -761,10 +1038,15 @@ export default function MainScreen() {
       ? guideSubtitle(new Date())
       : contentTypeFilter === 'home'
         ? ''
-        : countLabel(
-            filteredChannels.length,
-            trimmedQuery ? RESULT_NOUNS : SECTION_COUNT_NOUNS[contentTypeFilter]
-          );
+        : showCategoryCards
+          ? countLabel(categories.filter((c) => !hiddenCategories.includes(c)).length, [
+              'category',
+              'categories',
+            ])
+          : countLabel(
+              filteredChannels.length,
+              trimmedQuery ? RESULT_NOUNS : SECTION_COUNT_NOUNS[contentTypeFilter]
+            );
   if (view === 'settings') {
     title = 'Settings';
     subtitle = 'Ctrl+1–7 switches sections';
@@ -850,19 +1132,99 @@ export default function MainScreen() {
           />
         ) : (
           <>
-            <div className="px-10 pt-6">
-              <CategoryBar />
+            <div className="flex items-start gap-4 px-10 pt-6">
+              {liveCards && !showCategoryCards && trimmedQuery === '' ? (
+                <div className="flex min-w-0 flex-1 items-center gap-4 pb-2">
+                  <button
+                    type="button"
+                    data-nav
+                    onClick={backToCategories}
+                    className="flex shrink-0 items-center gap-2 rounded-full border border-border bg-text/5 px-4 py-2.5 text-[clamp(.9rem,1vw,1.15rem)] font-semibold text-text outline-none hover:bg-text/10 focus-visible:ring-4 focus-visible:ring-accent"
+                  >
+                    <ArrowLeft className="h-5 w-5" aria-hidden="true" />
+                    Categories
+                  </button>
+                  <h2 className="min-w-0 truncate font-display text-[clamp(1.4rem,2vw,2.5rem)] font-semibold text-text">
+                    {categoryFilter ?? (liveScope === 'favorites' ? 'Favorites' : 'All channels')}
+                  </h2>
+                </div>
+              ) : liveCards ? (
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
+                  <label className="relative min-w-[200px] max-w-[420px] flex-1">
+                    <Search
+                      className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-text-faint"
+                      aria-hidden="true"
+                    />
+                    {/* type="text": the top bar owns the page's one search box. */}
+                    <input
+                      type="text"
+                      enterKeyHint="search"
+                      value={categoryQuery}
+                      onChange={(e) => setCategoryQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape' && categoryQuery) {
+                          e.preventDefault();
+                          setCategoryQuery('');
+                        }
+                      }}
+                      placeholder="Search categories"
+                      aria-label="Search categories"
+                      className="w-full rounded-full border border-border bg-text/5 py-2 pl-10 pr-4 text-sm text-text outline-none placeholder:text-text-faint focus-visible:ring-4 focus-visible:ring-accent"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    aria-pressed={categoryFavoritesOnly}
+                    onClick={() => setDisplay({ categoryFavoritesOnly: !categoryFavoritesOnly })}
+                    className={`flex shrink-0 items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium outline-none focus-visible:ring-4 focus-visible:ring-accent ${
+                      categoryFavoritesOnly
+                        ? 'border-text bg-text text-bg'
+                        : 'border-border bg-text/5 text-text-muted hover:bg-text/10'
+                    }`}
+                  >
+                    <Star
+                      className={`h-4 w-4 ${categoryFavoritesOnly ? 'fill-current' : ''}`}
+                      aria-hidden="true"
+                    />
+                    Favorite categories
+                  </button>
+                </div>
+              ) : (
+                <div className="min-w-0 flex-1">
+                  <CategoryBar />
+                </div>
+              )}
+              {(contentTypeFilter === 'live' || categories.length > 0) && (
+                <button
+                  type="button"
+                  onClick={() => setDisplayOpen(true)}
+                  className="mt-0.5 flex shrink-0 items-center gap-2 rounded-full border border-border bg-text/5 px-4 py-2 text-sm font-medium text-text-muted outline-none hover:bg-text/10 focus-visible:ring-4 focus-visible:ring-accent"
+                >
+                  <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+                  Display
+                </button>
+              )}
             </div>
 
             {/* Channel list with virtual scrolling */}
             <div
-              ref={parentRef}
+              ref={listRef}
               className="flex-1 overflow-y-auto px-10 pb-32 pt-5"
               id="channel-list"
               role="region"
               aria-label="Channel list"
             >
-              {filteredChannels.length === 0 ? (
+              {showCategoryCards ? (
+                <CategoryGrid
+                  categories={categories}
+                  channels={allFilteredChannels}
+                  onPick={openCategory}
+                  onAll={() => openLiveScope('all')}
+                  onFavorites={() => openLiveScope('favorites')}
+                  focusKey={lastCategory}
+                  query={categoryQuery}
+                />
+              ) : filteredChannels.length === 0 ? (
                 <div className="flex flex-col items-center gap-3 py-16 text-center text-text-muted">
                   {trimmedQuery ? (
                     <>
@@ -939,7 +1301,14 @@ export default function MainScreen() {
                             gap inside the measured element, because rows are
                             absolutely positioned and stacked by `translateY`
                             rather than a normal-flow gap. */}
-                        <div className={`grid ${getGridClasses(columns)} gap-4 pb-4`}>
+                        <div
+                          className={`grid gap-4 pb-4 ${kind === 'poster' ? getGridClasses(columns) : ''}`}
+                          style={
+                            kind === 'poster'
+                              ? undefined
+                              : { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }
+                          }
+                        >
                           {rowItems.map((channel) => {
                             const isChannelBlocked = blockedMap.get(channel.id!) ?? false;
 
@@ -965,6 +1334,8 @@ export default function MainScreen() {
                                 tmdb={tmdbCards.get(channel.id)}
                                 isBlocked={isChannelBlocked}
                                 parentalVisibility={parentalVisibility}
+                                layout={cardLayout}
+                                onOpenMatch={matchButtons ? openMatch : undefined}
                               />
                             );
                           })}
@@ -980,7 +1351,7 @@ export default function MainScreen() {
 
         {/* Now Playing Bar. Not over Settings, where it would cover Save and
             Cancel; playback carries on and the dock returns on leaving. */}
-        {currentChannel && view !== 'settings' && (
+        {currentChannel && view !== 'settings' && !embedded && (
           <NowPlayingBar
             channel={currentChannel}
             epg={channelEpgData.get(currentChannel.id)}
@@ -989,8 +1360,44 @@ export default function MainScreen() {
             onStop={handleStop}
           />
         )}
-        <Toast aboveDock={Boolean(currentChannel) && view !== 'settings'} />
+        <Toast aboveDock={Boolean(currentChannel) && view !== 'settings' && !embedded} />
+        {currentChannel && isPlaying && embedded && (
+          <Suspense fallback={null}>
+            <PlayerLayer
+              channel={currentChannel}
+              epg={channelEpgData.get(currentChannel.id)}
+              onStop={handleStop}
+              onZap={zap}
+              onOpenSettings={() => setDisplayOpen(true)}
+            />
+          </Suspense>
+        )}
+        {sportsTarget &&
+          createPortal(
+            <Suspense fallback={null}>
+              <MatchModal
+                channel={sportsTarget.channel}
+                detected={sportsTarget.detected}
+                startMs={sportsTarget.startMs}
+                onClose={() => setSportsTarget(null)}
+                onWatch={handlePlayChannel}
+                onOpenSettings={() => {
+                  setSportsTarget(null);
+                  setDisplayOpen(true);
+                }}
+              />
+            </Suspense>,
+            document.body
+          )}
       </main>
+
+      <DisplayPanel
+        open={displayOpen}
+        onClose={() => setDisplayOpen(false)}
+        categories={categories}
+        counts={categoryCounts}
+        onPlayerConfigChanged={() => setPlayerConfigKey((k) => k + 1)}
+      />
 
       {/* PIN Entry Modal for blocked channels */}
       <PinEntryModal

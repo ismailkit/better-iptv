@@ -5,6 +5,8 @@
 
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
+use regex::Regex;
 
 /// Validate EPG URL format
 ///
@@ -200,9 +202,129 @@ pub fn epg_retry_allowed(
     }
 }
 
+lazy_static! {
+    /// US TV Parental Guidelines: TV-Y, TV-Y7, TV-G, TV-PG, TV-14, TV-MA.
+    static ref TV_RATING_RE: Regex = Regex::new(r"(?i)\bTV-(Y7|Y|G|PG|14|MA)\b").unwrap();
+    /// A named scheme with a number: "PEGI 16", "FSK: 12", "BBFC 15", "CSA -16".
+    static ref SCHEME_RE: Regex =
+        Regex::new(r"(?i)\b(?:PEGI|FSK|BBFC|CSA|USK|KIJKWIJZER|NICAM|IMDA|ACMA)\s*[:\-]?\s*-?(\d{1,2})\b")
+            .unwrap();
+    /// An age with an explicit sign: "18+", "+16", "(-12)", "[16+]".
+    static ref SIGNED_AGE_RE: Regex =
+        Regex::new(r"(?:^|[\s(\[])(?:\+\s?|-)(\d{1,2})\b|\b(\d{1,2})\s?\+").unwrap();
+}
+
+/// Ages a rating may stand for; anything else is a number that is not an age.
+const AGES: [u8; 11] = [3, 6, 7, 10, 12, 13, 14, 15, 16, 17, 18];
+
+fn as_age(n: u32) -> Option<u8> {
+    let n = u8::try_from(n.min(18)).ok()?;
+    AGES.contains(&n).then_some(n)
+}
+
+fn tv_rating_age(code: &str) -> Option<u8> {
+    match code.to_ascii_uppercase().as_str() {
+        "Y" | "G" => None,
+        "Y7" => Some(7),
+        "PG" => Some(10),
+        "14" => Some(14),
+        "MA" => Some(18),
+        _ => None,
+    }
+}
+
+/// Minimum age from the value of an XMLTV `<rating>` element.
+///
+/// Feeds write anything from a bare "16" to "FSK 16", "-16" (France), "12A",
+/// "R18", "TV-MA" or the MPAA letters. Ratings for all audiences (U, G, TV-Y,
+/// "0") give `None`: there is nothing to warn about.
+pub fn age_from_rating(value: &str) -> Option<u8> {
+    let v = value.trim();
+    if let Some(c) = TV_RATING_RE.captures(v) {
+        return tv_rating_age(&c[1]);
+    }
+    match v.to_ascii_uppercase().as_str() {
+        "PG" => return Some(10),
+        "PG-13" => return Some(13),
+        "R" => return Some(17),
+        "NC-17" | "X" | "XXX" | "R18" | "R18+" => return Some(18),
+        _ => {}
+    }
+    // First number in the value: "16", "-16", "FSK 16", "12A", "18+".
+    let digits: String = v
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok().and_then(as_age)
+}
+
+/// Minimum age written into a programme's title or synopsis, for feeds
+/// without `<rating>` elements: "Film (18+)", "[+16]", "PEGI 12", "TV-MA".
+///
+/// Only explicit forms count (a sign, a named scheme or a TV code), so
+/// "Episode 12" or "Top 40" never reads as an age. The highest age found wins.
+pub fn age_from_text(text: &str) -> Option<u8> {
+    let mut best: Option<u8> = None;
+    let mut take = |age: Option<u8>| {
+        if age > best {
+            best = age;
+        }
+    };
+    for c in TV_RATING_RE.captures_iter(text) {
+        take(tv_rating_age(&c[1]));
+    }
+    for c in SCHEME_RE.captures_iter(text) {
+        take(c[1].parse().ok().and_then(as_age));
+    }
+    for c in SIGNED_AGE_RE.captures_iter(text) {
+        let n = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str());
+        take(n.and_then(|n| n.parse().ok()).and_then(as_age));
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_values_map_to_minimum_ages() {
+        assert_eq!(age_from_rating("18"), Some(18));
+        assert_eq!(age_from_rating("-16"), Some(16));
+        assert_eq!(age_from_rating("FSK 12"), Some(12));
+        assert_eq!(age_from_rating("12A"), Some(12));
+        assert_eq!(age_from_rating("R18"), Some(18));
+        assert_eq!(age_from_rating("TV-MA"), Some(18));
+        assert_eq!(age_from_rating("TV-14"), Some(14));
+        assert_eq!(age_from_rating("PG-13"), Some(13));
+        assert_eq!(age_from_rating("NC-17"), Some(18));
+        assert_eq!(age_from_rating("21"), Some(18));
+        // All audiences, or not an age at all.
+        assert_eq!(age_from_rating("U"), None);
+        assert_eq!(age_from_rating("TV-G"), None);
+        assert_eq!(age_from_rating("0"), None);
+        assert_eq!(age_from_rating("Tous publics"), None);
+    }
+
+    #[test]
+    fn explicit_ages_in_titles_are_found() {
+        assert_eq!(age_from_text("Late Movie (18+)"), Some(18));
+        assert_eq!(age_from_text("Thriller [+16]"), Some(16));
+        assert_eq!(age_from_text("Film -12"), Some(12));
+        assert_eq!(age_from_text("Drama. PEGI 16. Violence."), Some(16));
+        assert_eq!(age_from_text("Rated TV-MA for language"), Some(18));
+        assert_eq!(age_from_text("Kids show 7+ and a 16+ trailer"), Some(16));
+    }
+
+    #[test]
+    fn plain_numbers_are_not_ages() {
+        assert_eq!(age_from_text("Episode 12"), None);
+        assert_eq!(age_from_text("Top 40"), None);
+        assert_eq!(age_from_text("Movie (2016)"), None);
+        assert_eq!(age_from_text("Season 3 - 16 teams left"), None);
+        assert_eq!(age_from_text("F1: Race 18"), None);
+    }
 
     #[test]
     fn epg_ids_are_normalised_to_trimmed_ascii_lowercase() {

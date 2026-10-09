@@ -2,7 +2,11 @@ import { useMemo } from 'react';
 import { usePlayerStore } from '../stores/player-store';
 import type { Section } from '../stores/player-store';
 import { shouldBlockChannel } from '../lib/parentalControls';
+import { categoryAllowed, passesKeywords, useDisplayStore } from '../stores/display-store';
 import type { Channel } from '../types';
+import { ageAllowed, inferChannelAge } from '../lib/ageFilter';
+import { normalizeEpgId } from '../lib/guideLayout';
+import { useCurrentAges } from './useCurrentAges';
 
 /**
  * Consolidated channel filtering hook.
@@ -14,6 +18,12 @@ import type { Channel } from '../types';
  * 2. Category filter
  * 3. Parental controls (hide mode)
  * 4. Search query
+ * 5. Display settings, live channels only: hidden categories and the
+ *    category / channel name filters apply everywhere; the chosen order
+ *    applies in Live TV.
+ * 6. Age filter, live channels only: by the age of the programme on now,
+ *    else what the channel's name says. The guide goes by the name only
+ *    (its rows cover other times and days); it filters programmes itself.
  */
 export function useChannelFilter(debouncedSearchQuery: string): Channel[] {
   const channels = usePlayerStore((s) => s.channels);
@@ -29,6 +39,14 @@ export function useChannelFilter(debouncedSearchQuery: string): Channel[] {
   const blockedCategories = usePlayerStore((s) => s.blockedCategories);
   const parentalAutoDetect = usePlayerStore((s) => s.parentalAutoDetect);
   const parentalVisibility = usePlayerStore((s) => s.parentalVisibility);
+  const hiddenCategories = useDisplayStore((s) => s.hiddenCategories);
+  const categoryKeywords = useDisplayStore((s) => s.categoryKeywords);
+  const categoryKeywordMode = useDisplayStore((s) => s.categoryKeywordMode);
+  const channelKeywords = useDisplayStore((s) => s.channelKeywords);
+  const channelKeywordMode = useDisplayStore((s) => s.channelKeywordMode);
+  const channelSort = useDisplayStore((s) => s.channelSort);
+  const ageFilter = useDisplayStore((s) => s.ageFilter);
+  const currentAges = useCurrentAges(ageFilter.mode !== 'off' && contentTypeFilter !== 'guide');
 
   // Step 1: Select base list by content type (O(1) - pre-computed).
   // A non-empty search spans every content type (design doc: "search stays
@@ -99,9 +117,65 @@ export function useChannelFilter(debouncedSearchQuery: string): Channel[] {
       );
     }
 
+    // Display settings (live channels only)
+    if (hiddenCategories.length > 0 || categoryKeywords.length > 0 || channelKeywords.length > 0) {
+      const rules = {
+        categorySort: 'provider' as const,
+        pinnedCategories: [],
+        hiddenCategories,
+        categoryKeywords,
+        categoryKeywordMode,
+      };
+      // One verdict per category, not one per channel.
+      const allowed = new Map<string, boolean>();
+      result = result.filter((c) => {
+        if (c.content_type !== 'live') return true;
+        if (c.group_name) {
+          let ok = allowed.get(c.group_name);
+          if (ok === undefined) {
+            ok = categoryAllowed(c.group_name, rules);
+            allowed.set(c.group_name, ok);
+          }
+          if (!ok) return false;
+        } else if (categoryKeywordMode === 'only' && categoryKeywords.length > 0) {
+          return false;
+        }
+        return passesKeywords(c.name, channelKeywords, channelKeywordMode);
+      });
+    }
+    if (ageFilter.mode !== 'off') {
+      result = result.filter((c) => {
+        if (c.content_type !== 'live') return true;
+        const now = currentAges && c.epg_id ? currentAges.get(normalizeEpgId(c.epg_id)) : undefined;
+        return ageAllowed(now ?? inferChannelAge(c.name, c.group_name), ageFilter);
+      });
+    }
+    if (contentTypeFilter === 'live' && channelSort !== 'provider') {
+      // Visit counts are read once per list, not subscribed to: playing a
+      // channel must not reshuffle the grid under the cursor. The order
+      // catches up the next time the list is built.
+      const visits = useDisplayStore.getState().channelVisits;
+      result = [...result].sort((a, b) =>
+        channelSort === 'favorites'
+          ? Number(b.is_favorite) - Number(a.is_favorite)
+          : channelSort === 'visits'
+            ? (visits[b.id] ?? 0) - (visits[a.id] ?? 0)
+            : a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })
+      );
+    }
+
     return result;
   }, [
     baseList,
+    contentTypeFilter,
+    hiddenCategories,
+    categoryKeywords,
+    categoryKeywordMode,
+    channelKeywords,
+    channelKeywordMode,
+    channelSort,
+    ageFilter,
+    currentAges,
     categoryFilter,
     debouncedSearchQuery,
     parentalEnabled,

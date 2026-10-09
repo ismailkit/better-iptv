@@ -197,6 +197,10 @@ export interface ChannelEpg {
   current_end: string | null;
   next: string | null;
   next_start: string | null;
+  /** Minimum age for the current programme (XMLTV rating, or "(18+)" in its title); absent if unknown. */
+  current_age?: number | null;
+  /** The current programme's genre ("Football", "Sports"); absent if the guide has none. */
+  current_category?: string | null;
 }
 
 /** Current/next programme for many channels in one IPC call (max 500 ids). */
@@ -209,6 +213,8 @@ export interface GuideProgram {
   description: string | null;
   start_time: string;
   end_time: string;
+  /** Minimum age (rating, or "(18+)" in the title); absent if unknown. */
+  age?: number | null;
 }
 
 /**
@@ -222,6 +228,11 @@ export async function getGuide(
   to: string
 ): Promise<Record<string, GuideProgram[]>> {
   return await invoke('get_guide', { epgIds, from, to });
+}
+
+/** Minimum age of what is on now, per normalized EPG id (only channels with one). */
+export async function getCurrentAges(): Promise<Record<string, number>> {
+  return await invoke('get_current_ages');
 }
 
 /** EPG ids with programmes between `from` and `to` (RFC 3339, at most seven days), normalized. */

@@ -129,6 +129,7 @@ export function useChannelPlayback(): UseChannelPlaybackResult {
         if (currentChannel?.id === channel.id && isPlaying) {
           await tauriStopPlayback();
           setIsPlaying(false);
+          setCurrentChannel(null);
           setCurrentProgram(null);
           setNextProgram(null);
           return;
@@ -178,13 +179,16 @@ export function useChannelPlayback(): UseChannelPlaybackResult {
     try {
       await tauriStopPlayback();
       setIsPlaying(false);
+      // Cleared like the keyboard stop does: a stopped channel left behind
+      // kept the in-app player mounted over a black, idle MPV.
+      setCurrentChannel(null);
       setCurrentProgram(null);
       setNextProgram(null);
     } catch (err) {
       logger.error('Failed to stop playback:', err);
       throw err;
     }
-  }, [setIsPlaying, setCurrentProgram, setNextProgram]);
+  }, [setIsPlaying, setCurrentChannel, setCurrentProgram, setNextProgram]);
 
   // Play episode(s) from a series
   const playEpisode = useCallback(

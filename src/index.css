@@ -73,3 +73,52 @@
     @apply font-display tracking-tight;
   }
 }
+
+/*
+ * In-app player (src/lib/player.ts setVideoHole). MPV draws under the page,
+ * so wherever the video shows the page must be see-through: html/body drop
+ * their background, and the app (#root) is masked out over the video box
+ * (mini player) or hidden outright (full player). The player's own controls
+ * live outside #root and stay visible.
+ */
+html.video-hole,
+html.video-hole body,
+html.video-full,
+html.video-full body {
+  background: transparent !important;
+}
+
+html.video-hole #root {
+  -webkit-mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  -webkit-mask-size:
+    100% 100%,
+    var(--hole-w) var(--hole-h);
+  -webkit-mask-position:
+    0 0,
+    var(--hole-x) var(--hole-y);
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-composite: xor;
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-size:
+    100% 100%,
+    var(--hole-w) var(--hole-h);
+  mask-position:
+    0 0,
+    var(--hole-x) var(--hole-y);
+  mask-repeat: no-repeat;
+  mask-composite: exclude;
+}
+
+html.video-full #root {
+  visibility: hidden;
+}
+
+/* Scrolls without showing a scrollbar (chip strip, tab rows). */
+@layer utilities {
+  .scrollbar-hide {
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}

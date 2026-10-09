@@ -38,11 +38,9 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 });
 
-// Mock ResizeObserver
-(globalThis as typeof globalThis & { ResizeObserver: unknown }).ResizeObserver = vi
-  .fn()
-  .mockImplementation(() => ({
-    observe: vi.fn(),
-    unobserve: vi.fn(),
-    disconnect: vi.fn(),
-  }));
+// Mock ResizeObserver (a class: callers construct it with `new`)
+(globalThis as typeof globalThis & { ResizeObserver: unknown }).ResizeObserver = class {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+};

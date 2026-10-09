@@ -6,25 +6,49 @@ const HOUR = 60 * MINUTE;
 /** Days the guide offers: today and the next four. */
 export const GUIDE_DAY_COUNT = 5;
 
+/** The guide's zoom levels: hours across the screen. */
+export const GUIDE_ZOOM_HOURS = [1, 2, 3, 6, 12];
+export const GUIDE_DEFAULT_HOURS = 3;
+
 /**
- * The guide's time window in epoch ms.
+ * The guide's time window in epoch ms, `hours` wide (its zoom), moved by
+ * `shift` half-windows (earlier < 0 < later).
  *
- * Today: from local `now` floored to the half hour, minus 30 minutes, for
- * three hours (20:12 -> 19:30-22:30). A later day: 18:00-21:00 local on that
- * day, built from calendar fields so a DST change that day stays correct.
+ * Today: from local `now` floored to the half hour, minus a sixth of the
+ * window (at least 30 minutes, in half hours), so most of it is still to
+ * come: 3 h at 20:12 -> 19:30-22:30. A later day: centred on 19:30 local
+ * (3 h -> 18:00-21:00), built from calendar fields so a DST change that day
+ * stays correct.
  */
-export function guideWindow(now: number, dayOffset: number): { from: number; to: number } {
+export function guideWindow(
+  now: number,
+  dayOffset: number,
+  hours = GUIDE_DEFAULT_HOURS,
+  shift = 0
+): { from: number; to: number } {
+  const span = hours * HOUR;
+  const step = (shift * span) / 2;
   if (dayOffset === 0) {
     const d = new Date(now);
     d.setMinutes(d.getMinutes() >= 30 ? 30 : 0, 0, 0);
-    const from = d.getTime() - 30 * MINUTE;
-    return { from, to: from + 3 * HOUR };
+    const lead = Math.max(1, Math.round(span / 6 / (30 * MINUTE))) * 30 * MINUTE;
+    const from = d.getTime() - lead + step;
+    return { from, to: from + span };
   }
   const d = new Date(now);
   const y = d.getFullYear();
   const m = d.getMonth();
   const day = d.getDate() + dayOffset;
-  return { from: new Date(y, m, day, 18, 0).getTime(), to: new Date(y, m, day, 21, 0).getTime() };
+  const centre = new Date(y, m, day, 19, 30).getTime();
+  const from = centre - span / 2 + step;
+  return { from, to: from + span };
+}
+
+/** Time-header spacing for a window `hours` wide: about six to twelve labels. */
+export function guideTickStep(hours: number): number {
+  if (hours <= 3) return 30 * MINUTE;
+  if (hours <= 6) return HOUR;
+  return 2 * HOUR;
 }
 
 /**

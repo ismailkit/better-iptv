@@ -15,38 +15,46 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// The `xmltv.php` address of every Xtream playlist.
+fn xtream_epg_urls(db: &rusqlite::Connection) -> Result<Vec<String>, AppError> {
+    Ok(queries::get_playlists(db)?
+        .into_iter()
+        .filter_map(|p| {
+            Some(get_xtream_epg_url(&XtreamCredentials {
+                server_url: p.url?,
+                username: p.xtream_username?,
+                password: p.xtream_password?,
+            }))
+        })
+        .collect())
+}
+
+/// Every guide a refresh downloads: the URL set in Settings, then each
+/// Xtream playlist's own guide. Each provider's guide covers only its own
+/// channels, so with two Xtream playlists the single `epg_url` (filled from
+/// the first import) left the second one without any guide.
+fn epg_source_urls(db: &rusqlite::Connection) -> Result<Vec<String>, AppError> {
+    let mut urls: Vec<String> = Vec::new();
+    let configured = queries::get_setting(db, "epg_url")?.filter(|u| !u.trim().is_empty());
+    for url in configured.into_iter().chain(xtream_epg_urls(db)?) {
+        let normalized = epg_domain::normalize_epg_url(&url);
+        if !urls.contains(&normalized) {
+            urls.push(normalized);
+        }
+    }
+    Ok(urls)
+}
+
+/// The playlist User-Agent when `target_epg_url` is an Xtream playlist's own
+/// guide, so the provider sees the same client as for the channel list.
 fn resolve_xtream_epg_user_agent(
     db: &rusqlite::Connection,
     target_epg_url: &str,
 ) -> Result<Option<String>, AppError> {
-    let active_profile_id =
-        queries::get_setting(db, "active_profile_id")?.and_then(|id| id.parse::<i64>().ok());
-
-    let Some(profile_id) = active_profile_id else {
-        return Ok(None);
-    };
-
-    let Some(playlist) = queries::get_playlist_by_id(db, profile_id)? else {
-        return Ok(None);
-    };
-
-    let Some(server_url) = playlist.url else {
-        return Ok(None);
-    };
-    let Some(username) = playlist.xtream_username else {
-        return Ok(None);
-    };
-    let Some(password) = playlist.xtream_password else {
-        return Ok(None);
-    };
-
-    let xtream_epg_url = get_xtream_epg_url(&XtreamCredentials {
-        server_url,
-        username,
-        password,
-    });
-
-    if xtream_epg_url != target_epg_url {
+    let is_xtream = xtream_epg_urls(db)?
+        .iter()
+        .any(|u| epg_domain::normalize_epg_url(u) == target_epg_url);
+    if !is_xtream {
         return Ok(None);
     }
 
@@ -180,6 +188,13 @@ pub async fn get_guide(
     .await
 }
 
+/// The minimum age of what is on now, per normalized EPG id (only channels
+/// whose current programme has one), for the channel list's age filter.
+#[tauri::command]
+pub async fn get_current_ages(state: State<'_, AppState>) -> Result<HashMap<String, u8>, AppError> {
+    with_db(&state.pool, |conn| Ok(crate::epg::get_current_ages(conn)?)).await
+}
+
 /// EPG ids with programmes between `from` and `to` (at most seven days): the
 /// guide lists only channels whose id is in this answer.
 #[tauri::command]
@@ -198,8 +213,7 @@ pub async fn get_guide_epg_ids(
 #[tauri::command]
 pub async fn get_epg_status(state: State<'_, AppState>) -> Result<EpgStatus, AppError> {
     with_db(&state.pool, |conn| {
-        let epg_url = queries::get_setting(conn, "epg_url")?;
-        let has_url = epg_url.map(|u| !u.trim().is_empty()).unwrap_or(false);
+        let has_url = !epg_source_urls(conn)?.is_empty();
 
         let last_fetched = queries::get_setting(conn, "epg_last_fetched")?;
         let program_count = queries::get_epg_program_count(conn)?;
@@ -219,86 +233,113 @@ pub async fn get_epg_status(state: State<'_, AppState>) -> Result<EpgStatus, App
 /// problems (no URL, invalid URL, download failure) and `Err` only for
 /// database failures. Shared by the Settings button and the background task.
 pub async fn run_epg_refresh(state: &AppState) -> Result<EpgRefreshResult, AppError> {
-    let epg_url = with_db(&state.pool, |conn| {
-        Ok(queries::get_setting(conn, "epg_url")?)
-    })
-    .await?;
-
-    let epg_url = match epg_url {
-        Some(url) if !url.trim().is_empty() => url,
-        _ => {
-            return Ok(EpgRefreshResult {
-                success: false,
-                programs_loaded: 0,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                error: Some("No EPG URL configured".to_string()),
-            });
-        }
-    };
-
-    info!(
-        "Force refreshing EPG from: {}",
-        crate::utils::mask_credentials(&epg_url)
-    );
-
-    let normalized_url = epg_domain::normalize_epg_url(&epg_url);
-    if let Err(e) = epg_domain::validate_epg_url(&normalized_url) {
-        warn!("Invalid EPG URL: {}", e);
+    let sources = with_db(&state.pool, epg_source_urls).await?;
+    if sources.is_empty() {
         return Ok(EpgRefreshResult {
             success: false,
             programs_loaded: 0,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            error: Some(format!("Invalid EPG URL: {}", e)),
+            error: Some("No EPG URL configured".to_string()),
         });
     }
 
-    let url_for_ua = normalized_url.clone();
+    // One guide at a time: provider guides run to hundreds of thousands of
+    // programmes each. One failing source does not discard the others.
+    let mut total = 0;
+    let mut errors = Vec::new();
+    for url in sources {
+        match refresh_one_source(state, url).await? {
+            Ok(count) => total += count,
+            Err(e) => errors.push(e),
+        }
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let success = total > 0 || errors.is_empty();
+    if success {
+        let stamp = timestamp.clone();
+        with_db(&state.pool, move |conn| {
+            Ok(crate::db::mutations::set_setting(
+                conn,
+                "epg_last_fetched",
+                &stamp,
+            )?)
+        })
+        .await?;
+    }
+    info!(
+        "EPG refresh completed: {} programs loaded, {} source(s) failed",
+        total,
+        errors.len()
+    );
+
+    Ok(EpgRefreshResult {
+        success,
+        programs_loaded: total,
+        timestamp,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    })
+}
+
+/// Download and store one guide. The outer `Err` is a database failure;
+/// the inner one a user-facing problem with this source.
+async fn refresh_one_source(
+    state: &AppState,
+    epg_url: String,
+) -> Result<Result<usize, String>, AppError> {
+    info!(
+        "Refreshing EPG from: {}",
+        crate::utils::mask_credentials(&epg_url)
+    );
+
+    if let Err(e) = epg_domain::validate_epg_url(&epg_url) {
+        warn!("Invalid EPG URL: {}", e);
+        return Ok(Err(format!("Invalid EPG URL: {}", e)));
+    }
+
+    let url_for_ua = epg_url.clone();
     let playlist_user_agent = with_db(&state.pool, move |conn| {
         resolve_xtream_epg_user_agent(conn, &url_for_ua)
     })
     .await?;
 
-    let programs = match crate::epg::fetch_and_parse_epg(
-        &normalized_url,
-        playlist_user_agent.as_deref(),
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            // Full chain for diagnosis; the log formatter masks credentials
-            warn!("Failed to fetch EPG: {:#}", e);
-            return Ok(EpgRefreshResult {
-                success: false,
-                programs_loaded: 0,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                error: Some(format!("Failed to fetch EPG: {}", e)),
-            });
-        }
-    };
+    let programs =
+        match crate::epg::fetch_and_parse_epg(&epg_url, playlist_user_agent.as_deref()).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Full chain for diagnosis; the log formatter masks credentials
+                warn!("Failed to fetch EPG: {:#}", e);
+                return Ok(Err(format!("Failed to fetch EPG: {}", e)));
+            }
+        };
 
-    let (count, timestamp) = with_db(&state.pool, move |conn| {
+    let count = with_db(&state.pool, move |conn| {
         let updated = crate::db::mutations::update_channel_epg_ids(conn)?;
         if updated > 0 {
             debug!("Updated EPG IDs for {} channels", updated);
         }
-
-        let count = crate::epg::store_epg_programs(conn, &programs)?;
-
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        crate::db::mutations::set_setting(conn, "epg_last_fetched", &timestamp)?;
-        Ok((count, timestamp))
+        Ok(crate::epg::store_epg_programs(conn, &programs)?)
     })
     .await?;
+    Ok(Ok(count))
+}
 
-    info!("EPG refresh completed: {} programs loaded", count);
-
-    Ok(EpgRefreshResult {
-        success: true,
-        programs_loaded: count,
-        timestamp,
-        error: None,
-    })
+/// Refresh now, in the background (after an Xtream import, whose guide is
+/// new), and tell the page when there is something to show.
+pub fn refresh_epg_in_background(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _guard = state.epg_refresh_lock.lock().await;
+        match run_epg_refresh(&state).await {
+            Ok(result) if result.success => {
+                if let Err(e) = app.emit("epg-refreshed", result) {
+                    warn!("EPG refresh: failed to emit event: {}", e);
+                }
+            }
+            Ok(result) => warn!("EPG refresh failed: {:?}", result.error),
+            Err(e) => warn!("EPG refresh failed: {}", e),
+        }
+    });
 }
 
 #[tauri::command]
@@ -331,7 +372,7 @@ pub async fn maybe_auto_refresh_epg(app: &AppHandle) {
     let settings = with_db(&state.pool, |conn| {
         Ok(queries::get_multiple_settings(
             conn,
-            &["epg_url", "epg_last_fetched", "epg_last_attempt"],
+            &["epg_last_fetched", "epg_last_attempt"],
         )?)
     })
     .await;
@@ -344,12 +385,13 @@ pub async fn maybe_auto_refresh_epg(app: &AppHandle) {
         }
     };
 
-    let has_url = settings
-        .get("epg_url")
-        .map(|u| !u.trim().is_empty())
-        .unwrap_or(false);
-    if !has_url {
-        return;
+    match with_db(&state.pool, epg_source_urls).await {
+        Ok(sources) if !sources.is_empty() => {}
+        Ok(_) => return,
+        Err(e) => {
+            warn!("EPG auto-refresh: could not read sources: {}", e);
+            return;
+        }
     }
 
     let now = chrono::Utc::now();

@@ -1,10 +1,29 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { CalendarRange, Lock, Play, X } from 'lucide-react';
+import {
+  CalendarRange,
+  ChevronLeft,
+  ChevronRight,
+  Lock,
+  Play,
+  SlidersHorizontal,
+  X,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
 import { usePlayerStore } from '../stores/player-store';
 import type { Channel } from '../types';
 import { getEpgStatus, type GuideProgram } from '../lib/tauri';
-import { GUIDE_DAY_COUNT, blockGeometry, normalizeEpgId } from '../lib/guideLayout';
+import {
+  GUIDE_DAY_COUNT,
+  GUIDE_ZOOM_HOURS,
+  blockGeometry,
+  guideTickStep,
+  normalizeEpgId,
+} from '../lib/guideLayout';
+import { ageAllowed, describeAgeFilter, inferChannelAge, type AgeFilter } from '../lib/ageFilter';
+import { useDisplayStore } from '../stores/display-store';
+import { AgeFilterControl } from './AgeFilterControl';
 import { formatClock, minutesLeft, progressPercent } from '../lib/epgTime';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
@@ -12,7 +31,6 @@ import { useGuide } from '../hooks/useGuide';
 import { CategoryBar } from './CategoryBar';
 import { ColorBars } from './ColorBars';
 
-const HALF_HOUR = 30 * 60_000;
 const NOW_TICK_MS = 30_000;
 const ROW_HEIGHT = 64; // h-16
 
@@ -101,6 +119,7 @@ interface GuideRowProps {
   blocked: boolean;
   selectedStart: string | null;
   onSelect: (channel: Channel, program: GuideProgram) => void;
+  ageFilter: AgeFilter;
 }
 
 const GuideRow = memo(function GuideRow({
@@ -115,17 +134,21 @@ const GuideRow = memo(function GuideRow({
   blocked,
   selectedStart,
   onSelect,
+  ageFilter,
 }: GuideRowProps) {
-  // Pure per programmes/window: geometry in percent of the track.
+  // Pure per programmes/window: geometry in percent of the track, and
+  // whether the age filter lets each one through (its own age, else what
+  // the channel's name says).
   const blocks = useMemo(() => {
     if (!programmes) return [];
-    const out: Array<{ program: GuideProgram; left: number; width: number }> = [];
+    const channelAge = inferChannelAge(channel.name, channel.group_name);
+    const out: Array<{ program: GuideProgram; left: number; width: number; shown: boolean }> = [];
     for (const program of programmes) {
       const g = blockGeometry(program.start_time, program.end_time, from, to, 100);
-      if (g) out.push({ program, ...g });
+      if (g) out.push({ program, ...g, shown: ageAllowed(program.age ?? channelAge, ageFilter) });
     }
     return out;
-  }, [programmes, from, to]);
+  }, [programmes, from, to, channel.name, channel.group_name, ageFilter]);
 
   return (
     <div
@@ -154,7 +177,23 @@ const GuideRow = memo(function GuideRow({
             <p className="flex h-full items-center text-[13px] text-text-faint">No guide data</p>
           )
         ) : (
-          blocks.map(({ program, left, width }) => {
+          blocks.map(({ program, left, width, shown }) => {
+            const place = {
+              left: `calc(${left}% + 2px)`,
+              width: `max(0px, calc(${width}% - 4px))`,
+            };
+            // Filtered out by age: an empty slot keeps the timeline readable.
+            if (!shown) {
+              return (
+                <div
+                  key={`${program.start_time}|${program.title}`}
+                  aria-hidden="true"
+                  title="Hidden by the age filter"
+                  style={place}
+                  className="absolute top-1 h-14 rounded-[10px] border border-dashed border-border"
+                />
+              );
+            }
             const selected = selectedStart === program.start_time;
             const airing = isAiring(program, now);
             const range = timeRange(program);
@@ -168,10 +207,7 @@ const GuideRow = memo(function GuideRow({
                 title={[program.title, range].filter(Boolean).join(' · ')}
                 aria-pressed={selected}
                 onClick={() => onSelect(channel, program)}
-                style={{
-                  left: `calc(${left}% + 2px)`,
-                  width: `max(0px, calc(${width}% - 4px))`,
-                }}
+                style={place}
                 className={cn(
                   'absolute top-1 h-14 overflow-hidden rounded-[10px] border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                   selected
@@ -281,6 +317,63 @@ function DetailPanel({ selection, now, dockVisible, playing, onWatch, onClose }:
   );
 }
 
+/** The guide's filter menu: the age filter (shared with Live TV). */
+function FiltersMenu({
+  open,
+  onOpenChange,
+  summary,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** What is filtered now ("Only 0–12"), or null. */
+  summary: string | null;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: globalThis.PointerEvent) => {
+      if (!ref.current?.contains(e.target as globalThis.Node)) onOpenChange(false);
+    };
+    // Escape closes the menu before anything else sees it (see the detail panel).
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      e.preventDefault();
+      onOpenChange(false);
+    };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open, onOpenChange]);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+        className={cn(CHIP, summary ? CHIP_ACTIVE : CHIP_IDLE, 'gap-2')}
+      >
+        <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+        {summary ? `Age: ${summary}` : 'Filters'}
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Guide filters"
+          className="absolute right-0 top-full z-30 mt-2 w-[min(380px,calc(100vw-48px))] rounded-2xl border border-border-strong bg-surface p-4 shadow-[0_20px_50px_rgba(0,0,0,.5)]"
+        >
+          <h3 className="mb-3 font-display text-base font-semibold text-text">Age</h3>
+          <AgeFilterControl />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface GuideViewProps {
   /**
    * The guide section's filtered list (every live channel, narrowed by
@@ -319,6 +412,21 @@ export function GuideView({
   // Session-only: the view remembers it while mounted, a fresh guide starts on all.
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const categoryFilter = usePlayerStore((s) => s.categoryFilter);
+  // Zoom (hours across) is kept; how far the window was moved is not.
+  const hours = useDisplayStore((s) => s.guideHours);
+  const setDisplay = useDisplayStore((s) => s.set);
+  const ageFilter = useDisplayStore((s) => s.ageFilter);
+  const [shift, setShift] = useState(0);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const zoomIndex = GUIDE_ZOOM_HOURS.indexOf(hours);
+  const zoom = useCallback(
+    (dir: -1 | 1) => {
+      const i = GUIDE_ZOOM_HOURS.indexOf(useDisplayStore.getState().guideHours);
+      const next = GUIDE_ZOOM_HOURS[Math.min(GUIDE_ZOOM_HOURS.length - 1, Math.max(0, i + dir))];
+      if (next !== undefined) setDisplay({ guideHours: next });
+    },
+    [setDisplay]
+  );
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), NOW_TICK_MS);
@@ -345,7 +453,13 @@ export function GuideView({
     () => (favoritesOnly ? channels.filter((c) => c.is_favorite) : channels),
     [channels, favoritesOnly]
   );
-  const { rows, programs, window: win, loading, rowsLoading } = useGuide(listed, dayOffset);
+  const {
+    rows,
+    programs,
+    window: win,
+    loading,
+    rowsLoading,
+  } = useGuide(listed, dayOffset, { hours, shift });
 
   // Rows are virtualized: a guide can list over a thousand channels, and only
   // the rows in view (plus overscan) are in the DOM. Fixed height, so no
@@ -380,6 +494,24 @@ export function GuideView({
   }, [shownList.version]);
   const virtualRows = rowVirtualizer.getVirtualItems();
 
+  // Ctrl + wheel (or a pinch on a touchpad) zooms the time axis instead of
+  // the page. A native listener: React's wheel handler cannot preventDefault.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let last = 0;
+    const onWheel = (e: globalThis.WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      // One step per gesture burst, not one per wheel event.
+      if (e.timeStamp - last < 200) return;
+      last = e.timeStamp;
+      zoom(e.deltaY > 0 ? 1 : -1);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [zoom]);
+
   // Escape closes the detail panel before anything else sees it. A bubble
   // listener on document runs before useKeyboardShortcuts' window listener
   // (and after TopBar's capture-phase profile-menu handler, which stops the
@@ -404,6 +536,7 @@ export function GuideView({
   const handleDay = (offset: number) => {
     if (offset === dayOffset) return;
     setDayOffset(offset);
+    setShift(0);
     setSelection(null);
   };
 
@@ -415,7 +548,12 @@ export function GuideView({
   const span = win.to - win.from;
   const ticks = useMemo(() => {
     const out: Array<{ at: number; label: string; pct: number }> = [];
-    for (let t = win.from; t < win.to; t += HALF_HOUR) {
+    // Labels on round local times (19:00, 20:00), wherever the window starts.
+    const step = guideTickStep(span / 3_600_000);
+    const d = new Date(win.from);
+    const midnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const first = midnight + Math.ceil((win.from - midnight) / step) * step;
+    for (let t = first; t < win.to; t += step) {
       out.push({
         at: t,
         label: formatClock(new Date(t).toISOString()),
@@ -485,6 +623,71 @@ export function GuideView({
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 px-10 pb-4">
+        <div role="group" aria-label="Time" className="flex items-center gap-1">
+          <button
+            type="button"
+            aria-label="Earlier"
+            title="Earlier"
+            onClick={() => setShift((s) => s - 1)}
+            className={cn(CHIP, CHIP_IDLE, 'w-[34px] px-0')}
+          >
+            <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            disabled={shift === 0}
+            onClick={() => setShift(0)}
+            className={cn(CHIP, CHIP_IDLE, 'disabled:opacity-50')}
+          >
+            {dayOffset === 0 ? 'Now' : 'Evening'}
+          </button>
+          <button
+            type="button"
+            aria-label="Later"
+            title="Later"
+            onClick={() => setShift((s) => s + 1)}
+            className={cn(CHIP, CHIP_IDLE, 'w-[34px] px-0')}
+          >
+            <ChevronRight className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+        <div role="group" aria-label="Zoom" className="ml-2 flex items-center gap-1">
+          <button
+            type="button"
+            aria-label="Zoom out (show more hours)"
+            title="Zoom out (Ctrl + wheel)"
+            disabled={zoomIndex === GUIDE_ZOOM_HOURS.length - 1}
+            onClick={() => zoom(1)}
+            className={cn(CHIP, CHIP_IDLE, 'w-[34px] px-0 disabled:opacity-50')}
+          >
+            <ZoomOut className="h-4 w-4" aria-hidden="true" />
+          </button>
+          <span
+            aria-live="polite"
+            className="min-w-[44px] text-center text-[13px] font-semibold tabular-nums text-text"
+          >
+            {hours} h
+          </span>
+          <button
+            type="button"
+            aria-label="Zoom in (show fewer hours)"
+            title="Zoom in (Ctrl + wheel)"
+            disabled={zoomIndex === 0}
+            onClick={() => zoom(-1)}
+            className={cn(CHIP, CHIP_IDLE, 'w-[34px] px-0 disabled:opacity-50')}
+          >
+            <ZoomIn className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+        <div className="flex-1" />
+        <FiltersMenu
+          open={filtersOpen}
+          onOpenChange={setFiltersOpen}
+          summary={describeAgeFilter(ageFilter)}
+        />
+      </div>
+
       <div
         ref={scrollRef}
         className={cn(
@@ -508,15 +711,19 @@ export function GuideView({
           <>
             <div className="sticky top-0 z-10 bg-bg pb-2">
               <div className="relative ml-[200px] h-6">
-                {ticks.map((tick) => (
-                  <span
-                    key={tick.at}
-                    className="absolute top-1 text-xs tabular-nums text-text-faint"
-                    style={{ left: `${tick.pct}%` }}
-                  >
-                    {tick.label}
-                  </span>
-                ))}
+                {ticks.map((tick) =>
+                  // A label the now badge would cover is left out (about
+                  // 60 px before it to 25 px after, on a typical track).
+                  nowPct !== null && tick.pct > nowPct - 6 && tick.pct < nowPct + 2.5 ? null : (
+                    <span
+                      key={tick.at}
+                      className="absolute top-1 text-xs tabular-nums text-text-faint"
+                      style={{ left: `${tick.pct}%` }}
+                    >
+                      {tick.label}
+                    </span>
+                  )
+                )}
                 {nowPct !== null && (
                   <span
                     className="absolute top-0 -translate-x-1/2 rounded-md bg-accent px-1.5 py-0.5 text-[11px] font-bold tabular-nums text-on-accent"
@@ -573,6 +780,7 @@ export function GuideView({
                           selection?.channel.id === channel.id ? selection.program.start_time : null
                         }
                         onSelect={handleSelect}
+                        ageFilter={ageFilter}
                       />
                     </div>
                   );

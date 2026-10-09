@@ -1,0 +1,12 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Better IPTV",
+        "width": 1280,
+        "height": 800,
+        "transparent": true
+      }
+    ]
+  }
+}

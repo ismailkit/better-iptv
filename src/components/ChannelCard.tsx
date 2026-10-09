@@ -1,5 +1,6 @@
-import { memo, useEffect, useState } from 'react';
-import { Play, Square, Star, Lock } from 'lucide-react';
+import { memo, useEffect, useMemo, useState } from 'react';
+import { Play, Square, Star, Lock, Trophy } from 'lucide-react';
+import { detectMatch } from '../lib/matchDetect';
 import type { Channel } from '../types';
 import type { EpgEntry } from '../stores/player-store';
 import { formatClock, progressPercent } from '../lib/epgTime';
@@ -21,8 +22,24 @@ interface ChannelCardProps {
   parentalVisibility?: 'hide' | 'lock' | 'blur';
   /** Callback when favorite star is toggled */
   onToggleFavorite?: (channelId: number) => void;
+  /** Opens the match centre; the button shows when the programme on now is a match. */
+  onOpenMatch?: (channel: Channel) => void;
   /** TMDB card for a movie or series shown in this live-shaped grid (search, Favorites). */
   tmdb?: TmdbCard;
+  /** Size and content from the display settings; absent keeps the fixed 208px card. */
+  layout?: ChannelCardLayout;
+}
+
+export interface ChannelCardLayout {
+  /** Logo/artwork area height in px. */
+  art: number;
+  /** Multiplies the text sizes; 1 is the desktop card. */
+  textScale: number;
+  showLogo: boolean;
+  showEpg: boolean;
+  showGroup: boolean;
+  /** Smallest age that gets a tag; absent turns age tags off. */
+  ageTagMin?: number;
 }
 
 /**
@@ -42,14 +59,31 @@ export const ChannelCard = memo(function ChannelCard({
   isBlocked = false,
   parentalVisibility = 'hide',
   onToggleFavorite,
+  onOpenMatch,
   tmdb,
+  layout,
 }: ChannelCardProps) {
   const [logoFailed, setLogoFailed] = useState(false);
   const [tmdbArtFailed, setTmdbArtFailed] = useState(false);
   useEffect(() => setTmdbArtFailed(false), [tmdb?.poster_url]);
   const tmdbArt = tmdb?.poster_url && !tmdbArtFailed ? tmdb.poster_url : null;
   const artSrc = tmdbArt ?? (channel.logo && !logoFailed ? channel.logo : null);
-  const showLogo = Boolean(artSrc);
+  const showLogo = Boolean(artSrc) && (layout?.showLogo ?? true);
+  // Local text matching only; nothing is fetched until the button is pressed.
+  const programme = epg?.current;
+  const genre = epg?.currentCategory;
+  const match = useMemo(
+    () =>
+      onOpenMatch && programme
+        ? detectMatch(programme, genre, channel.group_name, channel.name)
+        : null,
+    [onOpenMatch, programme, genre, channel.group_name, channel.name]
+  );
+  const showEpg = layout?.showEpg ?? true;
+  const showGroup = layout?.showGroup ?? true;
+  // Text sizes scale with the card through one CSS variable, so the classes
+  // below stay the desktop sizes when there is no layout.
+  const fs = (px: number) => (layout ? `calc(${px}px * var(--card-text, 1))` : undefined);
   // A movie or series in this grid has no programme; say what it is instead.
   const kindLabel =
     channel.content_type === 'vod' ? 'Movie' : channel.content_type === 'series' ? 'Series' : null;
@@ -59,6 +93,11 @@ export const ChannelCard = memo(function ChannelCard({
     epg?.currentStart && epg?.currentEnd ? progressPercent(epg.currentStart, epg.currentEnd) : null;
   const nowTime = epg?.currentStart ? formatClock(epg.currentStart) : '';
   const nextTime = epg?.nextStart ? formatClock(epg.nextStart) : '';
+  const ageMin = layout?.ageTagMin;
+  const ageTag =
+    ageMin !== undefined && epg?.currentAge !== undefined && epg.currentAge >= ageMin && !blocked
+      ? epg.currentAge
+      : null;
 
   return (
     // The whole card plays the channel, because that is what every other IPTV
@@ -69,12 +108,23 @@ export const ChannelCard = memo(function ChannelCard({
     // and screen-reader path, and the controls layered on top stop propagation.
     <article
       onClick={() => onPlay(channel)}
-      className={`group relative flex h-[208px] cursor-pointer flex-col overflow-hidden rounded-[14px] bg-surface ${
-        isPlaying ? 'border-[1.5px] border-accent' : 'border border-border'
-      }`}
+      // I opens the match centre from the focused card (keyboard, remote).
+      onKeyDown={(e) => {
+        if (match && (e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          onOpenMatch?.(channel);
+        }
+      }}
+      style={layout ? ({ '--card-text': layout.textScale } as React.CSSProperties) : undefined}
+      className={`group relative flex cursor-pointer flex-col overflow-hidden rounded-[14px] bg-surface transition-transform duration-150 has-[:focus-visible]:z-10 has-[:focus-visible]:scale-[1.03] has-[:focus-visible]:ring-4 has-[:focus-visible]:ring-accent ${
+        layout ? '' : 'h-[208px]'
+      } ${isPlaying ? 'border-[1.5px] border-accent' : 'border border-border'}`}
     >
       {/* Logo/artwork area */}
-      <div className="relative flex h-[124px] items-center justify-center bg-surface-2">
+      <div
+        className={`relative flex items-center justify-center bg-surface-2 ${layout ? '' : 'h-[124px]'}`}
+        style={layout ? { height: layout.art } : undefined}
+      >
         {showLogo ? (
           <img
             src={artSrc!}
@@ -92,10 +142,27 @@ export const ChannelCard = memo(function ChannelCard({
           <ColorBars label={channel.name} />
         )}
 
-        {isPlaying && (
-          <span className="absolute left-2 top-2 rounded-full bg-accent px-2 py-0.5 text-[11px] font-bold text-on-accent">
-            PLAYING
-          </span>
+        {(isPlaying || ageTag !== null) && (
+          <div className="absolute left-2 top-2 flex items-center gap-1.5">
+            {isPlaying && (
+              <span className="rounded-full bg-accent px-2 py-0.5 text-[11px] font-bold text-on-accent">
+                PLAYING
+              </span>
+            )}
+            {ageTag !== null && (
+              // Red for adult-only programmes, grey for every lower age.
+              <span
+                title={`Current programme: ages ${ageTag} and up`}
+                aria-label={`Rated ${ageTag} and up`}
+                style={{ fontSize: fs(12) }}
+                className={`rounded-md px-1.5 py-0.5 text-xs font-bold tabular-nums leading-none text-white shadow ${
+                  ageTag >= 18 ? 'bg-red-600' : 'bg-neutral-500'
+                }`}
+              >
+                +{ageTag}
+              </span>
+            )}
+          </div>
         )}
 
         {/* A blocked card's only control is the unlock button below: the
@@ -106,6 +173,7 @@ export const ChannelCard = memo(function ChannelCard({
           <>
             <button
               type="button"
+              data-nav-skip
               aria-label={channel.is_favorite ? 'Remove from favorites' : 'Add to favorites'}
               onClick={(e) => {
                 e.stopPropagation();
@@ -125,8 +193,27 @@ export const ChannelCard = memo(function ChannelCard({
               />
             </button>
 
+            {match && (
+              <button
+                type="button"
+                data-nav-skip
+                aria-label={`Match centre: ${match.home} v ${match.away} (I)`}
+                title={`Match centre: ${match.home} v ${match.away}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenMatch?.(channel);
+                }}
+                className="absolute right-11 top-2 flex h-[30px] items-center gap-1 rounded-full bg-black/55 px-2 text-[11px] font-bold text-white focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                <Trophy className="h-3.5 w-3.5 text-accent-text" aria-hidden="true" />
+                <span>Match</span>
+              </button>
+            )}
+
             <button
               type="button"
+              data-nav
+              data-channel-id={channel.id}
               aria-label={isPlaying ? `Stop ${channel.name}` : `Play ${channel.name}`}
               onClick={(e) => {
                 e.stopPropagation();
@@ -153,30 +240,36 @@ export const ChannelCard = memo(function ChannelCard({
       {/* Info block */}
       <div className="flex flex-col gap-[5px] px-3.5 pb-3.5 pt-3">
         <div className="flex items-baseline justify-between gap-2">
-          <span className="min-w-0 flex-1 truncate text-sm font-semibold text-text">
+          <span
+            className="min-w-0 flex-1 truncate text-sm font-semibold text-text"
+            style={{ fontSize: fs(14) }}
+          >
             {channel.name}
           </span>
-          {channel.group_name && (
-            <span className="shrink-0 truncate text-[11px] text-text-faint">
+          {showGroup && channel.group_name && (
+            <span
+              className="shrink-0 truncate text-[11px] text-text-faint"
+              style={{ fontSize: fs(11) }}
+            >
               {channel.group_name}
             </span>
           )}
         </div>
 
-        {blocked ? (
+        {!showEpg && !blocked ? null : blocked ? (
           <p className="truncate text-xs text-text-faint">
             {channel.group_name ? `${channel.group_name} · Locked` : 'Locked'}
           </p>
         ) : epg?.current ? (
           <>
-            <div className="flex items-baseline gap-1.5 text-[13px]">
+            <div className="flex items-baseline gap-1.5 text-[13px]" style={{ fontSize: fs(13) }}>
               {nowTime && (
                 <span className="font-semibold tabular-nums text-accent-text">{nowTime}</span>
               )}
               <span className="truncate text-text">{epg.current}</span>
             </div>
             {epg.next && (
-              <div className="flex items-baseline gap-1.5 text-xs">
+              <div className="flex items-baseline gap-1.5 text-xs" style={{ fontSize: fs(12) }}>
                 {nextTime && <span className="tabular-nums text-text-faint">{nextTime}</span>}
                 <span className="truncate text-text-faint">{epg.next}</span>
               </div>

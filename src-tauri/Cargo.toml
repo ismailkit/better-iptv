@@ -44,6 +44,11 @@ wait-timeout = "0.2"
 argon2 = "0.5"  # PIN hashing for parental controls
 rand = "0.9"    # Salt generation for PIN hashing
 
+# Win32 calls for the embedded player (keeping mpv's video under the webview).
+# Same version Tauri already builds, so this adds features, not a crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -1,3 +1,4 @@
+pub mod embedded;
 pub mod mpv;
 
 use crate::error::AppError;
@@ -90,6 +91,32 @@ pub async fn status(player: SharedPlayer) -> Result<PlaybackStatus, AppError> {
         Ok(mpv.status())
     })
     .await?
+}
+
+/// Play `urls` in the player the settings chose: in the app window when
+/// `embed` is set (Windows), else a separate MPV window. Whichever is not
+/// used is stopped, so switching the setting never leaves two players.
+pub async fn play_urls(
+    app: &tauri::AppHandle,
+    state: &crate::state::AppState,
+    urls: Vec<String>,
+    settings: PlaybackSettings,
+    embed: Option<embedded::EmbedOptions>,
+) -> Result<(), AppError> {
+    match embed {
+        Some(embed) => {
+            stop(state.mpv_player.clone()).await?;
+            state.embedded.load(app, &urls, &settings, &embed).await
+        }
+        None => {
+            state.embedded.stop().await;
+            if urls.len() == 1 {
+                play_stream(state.mpv_player.clone(), urls[0].clone(), settings).await
+            } else {
+                play_playlist(state.mpv_player.clone(), urls, settings).await
+            }
+        }
+    }
 }
 
 /// Check if MPV is installed on the system (runs `mpv --version`).

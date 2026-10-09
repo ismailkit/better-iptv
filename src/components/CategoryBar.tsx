@@ -1,5 +1,6 @@
-import { memo } from 'react';
+import { memo, useMemo } from 'react';
 import { usePlayerStore } from '../stores/player-store';
+import { orderCategories, useDisplayStore } from '../stores/display-store';
 
 interface CategoryBarProps {
   /** Overrides whether "All" reads as selected (the guide's Favorites chip also narrows the list). */
@@ -16,6 +17,17 @@ export const CategoryBar = memo(function CategoryBar({ allSelected, onAll }: Cat
   const categories = usePlayerStore((s) => s.categories);
   const categoryFilter = usePlayerStore((s) => s.categoryFilter);
   const setCategoryFilter = usePlayerStore((s) => s.setCategoryFilter);
+  const display = useDisplayStore();
+  // Same order and filtering as the category cards; "by size" needs counts
+  // the strip does not have, so it keeps the provider order there.
+  const shown = useMemo(
+    () =>
+      orderCategories(categories, new Map(), {
+        ...display,
+        categorySort: display.categorySort === 'count' ? 'provider' : display.categorySort,
+      }),
+    [categories, display]
+  );
 
   // Don't render if no categories available
   if (categories.length === 0) return null;
@@ -46,7 +58,7 @@ export const CategoryBar = memo(function CategoryBar({ allSelected, onAll }: Cat
       </button>
 
       {/* Category chips from provider */}
-      {categories.map((category) => (
+      {shown.map((category) => (
         <button
           key={category}
           onClick={() => setCategoryFilter(category)}

@@ -95,10 +95,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             start_time TIMESTAMP NOT NULL,
             end_time TIMESTAMP NOT NULL,
             category TEXT,
-            icon TEXT
+            icon TEXT,
+            age_rating INTEGER
         )",
         [],
     )?;
+
+    // Migration (3.1.0): minimum age from XMLTV <rating>, for the age tag on
+    // channel cards. Fails harmlessly when the column already exists.
+    let _ = conn.execute("ALTER TABLE epg_programs ADD COLUMN age_rating INTEGER", []);
 
     // Migration (2.8.0): older databases inserted a fresh copy of every future
     // programme on each EPG refresh, because `INSERT OR REPLACE` had no unique

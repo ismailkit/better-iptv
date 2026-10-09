@@ -201,6 +201,9 @@ pub async fn import_xtream_playlist(
         Ok(result)
     })
     .await?;
+    // The new provider's guide, now rather than at the next background
+    // check (up to 15 minutes away, and never if the app closes first).
+    crate::commands::epg::refresh_epg_in_background(app.clone());
     schedule_library_scan(app);
     Ok(imported)
 }

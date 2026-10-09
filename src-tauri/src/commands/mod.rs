@@ -6,6 +6,7 @@ pub mod playback;
 pub mod playlist;
 pub mod series;
 pub mod settings;
+pub mod sports;
 pub mod tmdb;
 pub mod update;
 
@@ -17,6 +18,7 @@ pub use playback::*;
 pub use playlist::*;
 pub use series::*;
 pub use settings::*;
+pub use sports::*;
 pub use tmdb::*;
 pub use update::*;
 

@@ -22,6 +22,10 @@ export interface EpgEntry {
   currentEnd?: string;
   next?: string;
   nextStart?: string;
+  /** Minimum age for the current programme, when the guide gives one. */
+  currentAge?: number;
+  /** The current programme's genre in the guide ("Football"). */
+  currentCategory?: string;
 }
 
 interface PlayerState {

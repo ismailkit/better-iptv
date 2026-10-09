@@ -1,4 +1,4 @@
-use crate::commands::playback::build_playback_options;
+use crate::commands::playback::{build_playback_options, read_embed_options};
 use crate::commands::with_db;
 use crate::db::queries;
 use crate::error::AppError;
@@ -47,6 +47,7 @@ pub async fn get_xtream_series_id(
 
 #[tauri::command]
 pub async fn play_episode_with_season(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     server_url: String,
     username: String,
@@ -62,12 +63,15 @@ pub async fn play_episode_with_season(
     let first_url = urls[0].clone();
 
     let title_for_settings = first_title.clone();
-    let settings = with_db(&state.pool, move |conn| {
-        build_playback_options(conn, Some(&title_for_settings))
+    let (settings, embed) = with_db(&state.pool, move |conn| {
+        Ok((
+            build_playback_options(conn, Some(&title_for_settings))?,
+            read_embed_options(conn)?,
+        ))
     })
     .await?;
 
-    playback::play_playlist(state.mpv_player.clone(), urls, settings).await?;
+    playback::play_urls(&app, &state, urls, settings, embed).await?;
 
     *state.current_channel.write().await = Some(CurrentChannel {
         id: None,
@@ -106,6 +110,7 @@ pub async fn get_local_series_info(
 /// database, never from the frontend.
 #[tauri::command]
 pub async fn play_series_episodes(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     episode_ids: Vec<i64>,
 ) -> Result<(), AppError> {
@@ -114,18 +119,18 @@ pub async fn play_series_episodes(
     }
 
     let ids = episode_ids.clone();
-    let (episodes, settings) = with_db(&state.pool, move |conn| {
+    let (episodes, settings, embed) = with_db(&state.pool, move |conn| {
         let rows = queries::get_series_episodes_by_ids(conn, &ids)?;
         let ordered = series_domain::order_episodes_by_ids(rows, &ids)?;
         let settings = build_playback_options(conn, Some(&ordered[0].title))?;
-        Ok((ordered, settings))
+        Ok((ordered, settings, read_embed_options(conn)?))
     })
     .await?;
 
     let urls: Vec<String> = episodes.iter().map(|e| e.url.clone()).collect();
     let first = &episodes[0];
 
-    playback::play_playlist(state.mpv_player.clone(), urls, settings).await?;
+    playback::play_urls(&app, &state, urls, settings, embed).await?;
 
     *state.current_channel.write().await = Some(CurrentChannel {
         id: None,
