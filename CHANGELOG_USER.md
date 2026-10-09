@@ -6,6 +6,39 @@ A simple overview of new features and improvements.
 
 ## Unreleased
 
+---
+
+## Version 3.1.0 (October 9, 2026)
+
+### New Features
+
+**Watch inside the app (Windows)**
+
+- Channels now play inside the app window instead of a separate player. Keep browsing while a small player plays in the corner, and drag it wherever you like
+- Open the full player for a seek bar, audio and subtitle choices, playback speed and quick channel switching
+- Rewind live TV: the last part of a live channel is kept, so you can go back and replay a moment, then jump back to live
+- Prefer the old separate player window? You can still choose it in the settings
+
+**Match centre**
+
+- When a channel shows a football or basketball match, open the live score, goals, cards, stats and line-ups. In the player, goals and cards are marked on the timeline
+
+**Make Live TV your own**
+
+- A new Display panel: bigger or smaller cards and text, a category screen, pin, star or hide categories, filter channels by name, and sort by what you watch most
+- Category cards have a clear coloured border that gets thicker on the one you have selected
+- Move around with the arrow keys or a TV remote
+
+**Age filter**
+
+- Show only channels and programmes for an age range (for example children's), or hide a range (for example 16 and up), in Live TV and in the TV Guide
+- Ages come from the program guide when your provider includes them; adult and children's channels are also recognised by their name
+
+**TV Guide**
+
+- Zoom in or out from 1 to 12 hours (or hold Ctrl and use the mouse wheel), and step earlier or later in the day
+- The guide is now downloaded for every provider playlist you add, right after you add it
+
 ### Improvements
 
 **Big performance improvements for large playlists**
@@ -25,6 +58,10 @@ A simple overview of new features and improvements.
 - Channels further down a long list now show what's on, instead of "No guide data"
 - When a provider turns a playlist update away, the app now says so (for example a busy account or a wrong password) instead of an unclear error
 - Fixed playlist updates failing for providers that send their channel list compressed
+- Stopping the player no longer leaves a black screen behind
+- The loading spinner in the player spins properly again
+- Smoother video in the full-screen player
+- Program guides now download straight after you add a provider playlist, so the guide is no longer empty on a fresh install
 
 ## Version 3.0.0 (September 27, 2026)
 

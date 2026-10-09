@@ -5,8 +5,32 @@ This file is a developer-changelog, aimed towards development changes.
 
 ## Unreleased
 
+## [3.1.0] - 2026-10-09
+
+### Added
+
+- **In-app player (Windows)** - `playback/embedded.rs` runs one long-lived `mpv.exe` that draws into the main window (`--wid`) under a transparent webview; the controls are HTML on top. The video's place is set with `video-margin-ratio-*`, so the mini player and the full player share one process, and `loadfile` switches channels without restarting mpv
+  - Driven over the JSON IPC pipe: observed properties are mirrored to the page as one `player-state` event at most four times a second (at once for pause, tracks, loading); `player_set_property`, `player_seek`, `player_frame_step` and `player_set_rect` steer it, with a whitelist and ranges for settable properties
+  - Live channels keep an on-disk back buffer (`--demuxer-max-back-bytes`, "Rewind buffer" in Display) so the timeline can rewind and replay; `--force-seekable` makes the buffer seekable
+  - `PlayerLayer`: a mini player in a corner while browsing, draggable anywhere (the spot is kept in `display-store.miniPos`, picking a corner resets it), and a full player with a seek bar, audio/subtitle/speed menus, hold-to-scan, zapping (PgUp/PgDn) and keyboard shortcuts; `VideoSurface` masks a hole in `#root` over the video
+  - The embedded player overrides the high-quality profile's polar scalers and debanding (`spline36`/`mitchell`, `--deband=no`): composited under the webview at full-window size they dropped frames on many GPUs
+  - Linux and macOS keep the separate mpv window; Settings can choose it on Windows too (`player_mode`)
+- **Match centre (Highlightly)** - `sports/` and `commands/sports.rs` look up the match behind a programme (`lib/matchDetect.ts` spots "Team v Team" plus a sport signal locally, so nothing is requested until a match is opened): live score, events, stats, line-ups and highlights, with a cache and a request quota. The full player marks goals and cards on the timeline (shifted by the stream delay) and shows the match in a side panel
+- **Display panel and category screen** - per-device display settings (`stores/display-store.ts`, localStorage): interface scale, a category card screen with pinned, starred and hidden categories, sort orders, category and channel name filters (hide or show only), card sizes, age tags from the programme on now, "Most visited" ordering. `useSpatialNavigation` moves focus with the arrow keys / a remote's D-pad
+  - Category cards have a full border in the category's colour, thicker on hover and much thicker on the focused card (drawn as an overlay, so the text never moves), replacing the colour strip on the left
+- **Age filter for Live TV and the guide** - `lib/ageFilter.ts`: off, show only a range, or hide a range, with a switch for items without a known age. A programme's age is its rating or an explicit age in its title/synopsis; without one, `inferChannelAge` reads adult (18) and children's (0) channels from the name and category
+  - `get_current_ages` (`epg/xmltv.rs`) returns the age of what is on now for every channel in one scan, so `useChannelFilter` can filter the whole list (re-read every 5 minutes and on `epg-refreshed`, only while the filter is on)
+  - `GuideProgram` carries `age`; guide blocks the filter removes become empty dashed slots. Guide rows are filtered by the channel name only, since they cover other times and days
+- **TV Guide zoom and time navigation** - 1, 2, 3, 6 or 12 hours across (buttons or Ctrl + wheel, kept in `guideHours`), Earlier / Later by half a window and back to Now. `guideWindow(now, day, hours, shift)` and `guideTickStep` place the window and its labels on round local times; a label under the now badge is left out
+- **Every Xtream playlist's own guide** - `run_epg_refresh` downloads the Settings EPG URL plus each Xtream playlist's `xmltv.php` (`epg_source_urls`, deduplicated), one at a time, keeping what the others stored when one fails. With two Xtream playlists the single `epg_url`, filled from the first import, left the second without a guide
+  - An Xtream import starts a guide refresh at once (`refresh_epg_in_background`) instead of waiting for the 15-minute background check, which never came when the app closed first: a fresh install had stored 0 programmes
+  - The playlist User-Agent is used for any Xtream playlist's guide, not only the active profile's
+
 ### Fixed
 
+- **Stopping the in-app player closes it** - the Stop button cleared `isPlaying` but kept `currentChannel`, so `PlayerLayer` stayed mounted over an idle mpv: a black screen, the app hidden, and the player's timers and match polling still running. `stop` (and clicking the playing channel) now clear the channel as the keyboard stop did, and the player renders only while playing
+- **The player's loading spinner turns** - `animate-spin` sets `transform`, which replaced the `-translate` centring, so the browser interpolated translate -> rotate as a matrix and the icon slid diagonally; it is centred by a flex box now
+- The seek bar no longer eases its width between the 4 Hz updates, which kept the transparent page repainting over the video
 - **Provider credentials no longer written to the log file** - `epg/xmltv.rs` logged `Fetching EPG from: <url>` at info level with the Xtream `xmltv.php` URL unmasked, so every EPG fetch wrote the account's username and password in plain text to `better-ip-tv.log`
   - `fetch_and_parse_epg` now logs the URL through `utils::mask_credentials`
   - `From<reqwest::Error>` and the reqwest branch of `From<anyhow::Error>` in `error.rs` mask the message: reqwest embeds the full request URL (`error sending request for url (...)`), and `AppError::Http` both reaches the log and is shown in the UI
